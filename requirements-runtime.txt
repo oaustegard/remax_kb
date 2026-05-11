@@ -1,0 +1,7 @@
+# Reader/skill-side deps: querying a .kb from a vanilla container.
+# Torch-free — suitable for claude.ai project containers.
+numpy>=1.24
+scipy>=1.10
+onnxruntime>=1.17
+tokenizers>=0.15
+remax @ git+https://github.com/oaustegard/remax.git

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remax_kb"
+version = "0.1.0"
+description = "Portable 1-bit binary embedding knowledgebase format (.kb) — packer + reader + Claude skill."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "Oskar Austegard"}]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "remax @ git+https://github.com/oaustegard/remax.git",
+]
+
+[project.optional-dependencies]
+build = [
+    "torch",
+    "transformers",
+    "sentence-transformers",
+    "peft",
+    "safetensors",
+    "huggingface_hub",
+]
+runtime = [
+    "onnxruntime>=1.17",
+    "tokenizers>=0.15",
+]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["remax_kb*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.urls]
+Homepage = "https://github.com/oaustegard/remax_kb"
+Repository = "https://github.com/oaustegard/remax_kb"
+Issues = "https://github.com/oaustegard/remax_kb/issues"
+Spec = "https://github.com/oaustegard/remax_kb/blob/main/SPEC.md"

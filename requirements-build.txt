@@ -1,0 +1,10 @@
+# Packer-side deps: building a .kb from a corpus.
+# Heavyweight (torch + transformers + adapters) — only needed offline.
+numpy>=1.24
+remax @ git+https://github.com/oaustegard/remax.git
+torch
+transformers
+sentence-transformers
+peft
+safetensors
+huggingface_hub
