@@ -116,6 +116,30 @@ remax_kb/
     └── test_retrieval.py
 ```
 
+## Validation
+
+The `tests/` suite exercises the format end-to-end:
+
+- `test_roundtrip.py` (7 tests) — pack + read mechanics with a
+  deterministic synthetic-stub embedder. No torch, no model downloads.
+- `test_retrieval.py::test_torch_query_lands_in_top_3` — packs
+  `examples/tiny_corpus/` via the jina torch loader, queries with
+  the same loader, asserts the topically-correct source file appears
+  in top-3.
+- `test_retrieval.py::test_onnx_matches_torch_top1` — the actual
+  proof-of-concept claim: pack with torch, query the *same* `.kb`
+  with both torch and ONNX embedders, assert they agree on top-1.
+  Gated by `REMAX_KB_FULL=1` because it pulls the ~847 MB ONNX export.
+
+To run the heavy tests locally, clone `jina-v5-nano-mirror` next to
+this repo (or set `$JINA_V5_NANO_MIRROR_PATH`), install the heavy
+deps, then:
+
+```bash
+pip install -r requirements-build.txt -r requirements-runtime.txt
+REMAX_KB_FULL=1 pytest -q
+```
+
 ## Scope
 
 This is a proof-of-concept artifact, not production retrieval

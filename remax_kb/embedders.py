@@ -134,6 +134,17 @@ class JinaONNXEmbedder:
     def _resolve_model(self) -> Path:
         if self._model_path is not None:
             return self._model_path
+        # If the upstream mirror's ONNX cache already has the file, reuse it.
+        mirror_cache = (
+            Path(
+                os.environ.get("JINA_V5_NANO_CACHE")
+                or Path.home() / ".cache" / "jina-v5-nano-mirror"
+            )
+            / f"sha-{JINA_V5_NANO_REVISION[:10]}-onnx"
+            / "model.onnx"
+        )
+        if mirror_cache.exists() and _sha256(mirror_cache) == self.release_sha256:
+            return mirror_cache
         dst = _cache_root() / "jina-v5-nano" / "model.onnx"
         _download(self.release_url, dst, self.release_sha256)
         return dst
@@ -144,14 +155,21 @@ class JinaONNXEmbedder:
         env_path = os.environ.get("REMAX_KB_TOKENIZER_PATH")
         if env_path:
             return Path(env_path)
-        # Default location in the cache root. If absent, the user must
-        # stage it — we don't auto-download an unhashed tokenizer.json.
+        # Try the cloned mirror checkout if present — its model/ subdir
+        # ships the upstream tokenizer.json verbatim.
+        mirror = os.environ.get("JINA_V5_NANO_MIRROR_PATH")
+        if mirror:
+            cand = Path(mirror) / "model" / "tokenizer.json"
+            if cand.exists():
+                return cand
+        # Default cache location. Absent → user must stage it.
         guess = _cache_root() / "jina-v5-nano" / "tokenizer.json"
         if not guess.exists():
             raise FileNotFoundError(
                 f"tokenizer.json not found at {guess}. Either set "
-                f"$REMAX_KB_TOKENIZER_PATH or pass tokenizer_path=... "
-                f"to JinaONNXEmbedder(). Stage it from the upstream "
+                f"$REMAX_KB_TOKENIZER_PATH, point $JINA_V5_NANO_MIRROR_PATH "
+                f"at a checkout, or pass tokenizer_path=... to "
+                f"JinaONNXEmbedder(). Source: "
                 f"https://huggingface.co/{JINA_V5_NANO_MODEL_ID}"
             )
         return guess
@@ -244,18 +262,43 @@ class JinaTorchEmbedder:
     def _load(self):
         if self._embed_fn is not None:
             return self._embed_fn
-        # Lazy import — only when actually invoked.
+        # Lazy import — only when actually invoked. The mirror is not a
+        # pip-installable package; resolve via either:
+        #   1. A checkout pointed at by $JINA_V5_NANO_MIRROR_PATH
+        #      (a path to the cloned repo or its scripts/ subdir).
+        #   2. ``embed`` already discoverable on sys.path (e.g. CCotw
+        #      muninn-utilities path injection, or a vendored copy).
+        import importlib
+        import os as _os
+        import sys as _sys
+
+        env_path = _os.environ.get("JINA_V5_NANO_MIRROR_PATH")
+        if env_path:
+            from pathlib import Path as _Path
+
+            root = _Path(env_path)
+            scripts_dir = root if root.name == "scripts" else root / "scripts"
+            if not (scripts_dir / "embed.py").exists():
+                raise FileNotFoundError(
+                    f"$JINA_V5_NANO_MIRROR_PATH={env_path!r} does not point to "
+                    f"a jina-v5-nano-mirror checkout (no scripts/embed.py)"
+                )
+            if str(scripts_dir) not in _sys.path:
+                _sys.path.insert(0, str(scripts_dir))
+
         try:
-            from jina_v5_nano_mirror.scripts.embed import embed as _embed
-        except ImportError as exc:
+            mod = importlib.import_module("embed")
+            embed = getattr(mod, "embed")
+        except (ImportError, AttributeError) as exc:
             raise ImportError(
-                "JinaTorchEmbedder requires the jina-v5-nano-mirror torch "
-                "loader. Install via "
-                "`pip install git+https://github.com/oaustegard/jina-v5-nano-mirror.git` "
-                "or vendor scripts/embed.py onto PYTHONPATH."
+                "JinaTorchEmbedder needs the jina-v5-nano-mirror torch "
+                "loader. Either set $JINA_V5_NANO_MIRROR_PATH to the cloned "
+                "repo, or vendor scripts/embed.py onto PYTHONPATH. The "
+                "mirror is not pip-installable. Source: "
+                "https://github.com/oaustegard/jina-v5-nano-mirror"
             ) from exc
-        self._embed_fn = _embed
-        return _embed
+        self._embed_fn = embed
+        return embed
 
     def encode(self, texts: list[str], *, prompt: str) -> np.ndarray:
         if prompt not in self.prompts:
