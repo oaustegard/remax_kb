@@ -29,7 +29,19 @@ runtime = [
     "onnxruntime>=1.17",
     "tokenizers>=0.15",
 ]
-dev = ["pytest>=7.0"]
+# Optional file handlers for the directory packer. Pure-python, light.
+handlers = [
+    "beautifulsoup4>=4.11",
+    "pypdf>=4.0",
+]
+# Hosted API embedders (Google Gemini, etc.)
+api = [
+    "httpx>=0.25",
+]
+dev = ["pytest>=7.0", "beautifulsoup4>=4.11", "pypdf>=4.0", "httpx>=0.25"]
+
+[project.scripts]
+remax-kb = "remax_kb.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

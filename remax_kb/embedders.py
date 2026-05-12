@@ -1,7 +1,7 @@
 """Thin embedder wrappers exposing the ``Embedder`` protocol expected by
 the reader and packer.
 
-Two implementations:
+Three implementations:
 
 - :class:`JinaONNXEmbedder` — torch-free runtime path. Wraps
   ``jina_v5_nano_mirror.scripts.embed_onnx``. Downloads the merged-
@@ -11,7 +11,38 @@ Two implementations:
 - :class:`JinaTorchEmbedder` — packer-side path. Wraps the torch loader
   in the same upstream. Lets the packer pick any task adapter.
 
-Both expose ``fingerprint()`` and ``encode(texts, prompt=...)``.
+- :class:`GeminiEmbedder` — Google Generative Language API path. No
+  local model; talks to ``generativelanguage.googleapis.com``. The
+  ``.kb`` carries no ``release_url`` for this embedder; readers
+  identify it by ``model_id`` alone.
+
+All three expose ``fingerprint()`` and ``encode(texts, prompt=...)``.
+
+Implementing your own embedder is the recommended way to plug in
+other providers (Cohere, OpenAI, Voyage, etc.). The protocol is
+documented in :mod:`remax_kb.read`. Minimum surface area::
+
+    class MyEmbedder:
+        model_id = "vendor/model-name"
+        model_revision = ""
+        task_adapter = "retrieval"
+        pooling = "native"
+        full_dim = 1024
+        normalize_l2 = True
+        release_url = None        # if API-backed
+        release_sha256 = None
+        prompts = {"query": "...", "document": "..."}
+
+        def fingerprint(self) -> dict:
+            return {
+                "model_id": self.model_id,
+                "task_adapter": self.task_adapter,
+                "pooling": self.pooling,
+                "full_dim": self.full_dim,
+            }
+
+        def encode(self, texts: list[str], *, prompt: str) -> np.ndarray:
+            ...   # returns (N, full_dim) float32, L2-normalized
 """
 from __future__ import annotations
 
@@ -314,3 +345,164 @@ class JinaTorchEmbedder:
             prompt_name=prompt,
             truncate_dim=None,  # always return full_dim; truncation is reader's job
         ).astype(np.float32)
+
+
+# --------------------------------------------------------------------- #
+# Gemini (Google Generative Language API)
+# --------------------------------------------------------------------- #
+
+
+GEMINI_DEFAULT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_DEFAULT_MODEL = "gemini-embedding-001"
+
+
+class GeminiEmbedder:
+    """Google Gemini embedder via the Generative Language API.
+
+    API-backed: there is no local model asset, so the ``.kb`` manifest
+    records ``release_url=None``/``release_sha256=None``. Readers and
+    packers must both have ``$GEMINI_API_KEY`` (or pass ``api_key=...``)
+    available — the embedder talks to ``generativelanguage.googleapis.com``
+    directly for every encode call.
+
+    Prompt mapping:
+
+    * ``prompt="document"`` → ``task_type=RETRIEVAL_DOCUMENT``
+    * ``prompt="query"``    → ``task_type=RETRIEVAL_QUERY``
+
+    The pair produces embeddings in a compatible space; we still
+    L2-normalize on the client side so downstream centering+truncation
+    works identically to the Jina path.
+    """
+
+    pooling = "native"
+    normalize_l2 = True
+    release_url: str | None = None
+    release_sha256: str | None = None
+    # The "task adapter" abstraction maps cleanly to Gemini's task_type
+    # parameter. The manifest stores "retrieval" so reader-side validation
+    # can match it; the embedder picks DOCUMENT vs QUERY internally.
+    task_adapter = "retrieval"
+    prompts = {"query": "", "document": ""}  # task_type is passed via param, not prefix
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        model: str = GEMINI_DEFAULT_MODEL,
+        output_dim: int = 768,
+        endpoint: str = GEMINI_DEFAULT_ENDPOINT,
+        max_retries: int = 5,
+        request_timeout: float = 60.0,
+        batch_limit: int = 100,
+    ):
+        self._api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        if not self._api_key:
+            raise RuntimeError(
+                "GeminiEmbedder requires an API key. Pass api_key=... "
+                "or set $GEMINI_API_KEY."
+            )
+        self.model = model
+        self.model_id = f"google/{model}"
+        # Empty for hosted API models — Google doesn't expose a per-model SHA.
+        self.model_revision = ""
+        self.full_dim = int(output_dim)
+        self._endpoint = endpoint.rstrip("/")
+        self._max_retries = int(max_retries)
+        self._timeout = float(request_timeout)
+        self._batch_limit = int(batch_limit)
+
+    def fingerprint(self) -> dict[str, Any]:
+        # Includes both the manifest-validation keys (model_id,
+        # task_adapter, pooling, full_dim) and informational
+        # task_type_* labels that document the prompt mapping.
+        return {
+            "model_id": self.model_id,
+            "task_adapter": self.task_adapter,
+            "pooling": self.pooling,
+            "full_dim": self.full_dim,
+            "task_type_doc": "RETRIEVAL_DOCUMENT",
+            "task_type_query": "RETRIEVAL_QUERY",
+        }
+
+    @staticmethod
+    def _task_type_for(prompt: str) -> str:
+        if prompt == "document":
+            return "RETRIEVAL_DOCUMENT"
+        if prompt == "query":
+            return "RETRIEVAL_QUERY"
+        raise ValueError(
+            f"unknown prompt {prompt!r}; expected 'document' or 'query'"
+        )
+
+    def encode(self, texts: list[str], *, prompt: str = "document") -> np.ndarray:
+        if not texts:
+            return np.zeros((0, self.full_dim), dtype=np.float32)
+        task_type = self._task_type_for(prompt)
+
+        import httpx  # local import — httpx is an optional dep
+
+        out = np.empty((len(texts), self.full_dim), dtype=np.float32)
+        with httpx.Client(timeout=self._timeout) as client:
+            for start in range(0, len(texts), self._batch_limit):
+                batch = texts[start : start + self._batch_limit]
+                batch_vecs = self._batch_embed(client, batch, task_type)
+                out[start : start + len(batch)] = batch_vecs
+        return out
+
+    def _batch_embed(
+        self, client, texts: list[str], task_type: str
+    ) -> np.ndarray:
+        """One ``:batchEmbedContents`` request, with exponential backoff
+        on 429 / 5xx."""
+        import httpx
+
+        url = (
+            f"{self._endpoint}/models/{self.model}:batchEmbedContents"
+            f"?key={self._api_key}"
+        )
+        body = {
+            "requests": [
+                {
+                    "model": f"models/{self.model}",
+                    "content": {"parts": [{"text": t}]},
+                    "taskType": task_type,
+                    "outputDimensionality": self.full_dim,
+                }
+                for t in texts
+            ]
+        }
+
+        last_exc: Exception | None = None
+        for attempt in range(self._max_retries):
+            try:
+                r = client.post(url, json=body)
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                self._sleep_backoff(attempt)
+                continue
+            if r.status_code == 200:
+                data = r.json()
+                vecs = [emb["values"] for emb in data["embeddings"]]
+                arr = np.asarray(vecs, dtype=np.float32)
+                norms = np.linalg.norm(arr, axis=1, keepdims=True)
+                norms = np.where(norms == 0, 1.0, norms)
+                return (arr / norms).astype(np.float32)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_exc = httpx.HTTPStatusError(
+                    f"transient {r.status_code}: {r.text[:200]}",
+                    request=r.request,
+                    response=r,
+                )
+                self._sleep_backoff(attempt)
+                continue
+            r.raise_for_status()
+        assert last_exc is not None
+        raise last_exc
+
+    @staticmethod
+    def _sleep_backoff(attempt: int) -> None:
+        import time
+
+        # 1s, 2s, 4s, 8s, 16s — capped via max_retries
+        time.sleep(min(2 ** attempt, 30))

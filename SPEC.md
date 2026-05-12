@@ -78,10 +78,16 @@ fingerprint check.
 
 `embedder.release_url` — fetchable URL of the *runtime* embedder asset
 (typically an ONNX export). The reader will download from this URL if it
-cannot find a cached copy.
+cannot find a cached copy. **Optional** — `null` (JSON) or absent for
+API-backed embedders (e.g. Google Gemini, Cohere, OpenAI) where there
+is no local asset to fetch. When absent, readers identify the embedder
+by `model_id` alone and skip SHA256 verification; the host-side
+embedder implementation talks to the upstream API directly.
 
 `embedder.release_sha256` — SHA256 of the asset at `release_url`. The
-reader MUST verify after download and refuse mismatched bytes.
+reader MUST verify after download and refuse mismatched bytes. Optional
+on the same condition as `release_url` — both fields must be present
+together or both `null`.
 
 `embedder.task_adapter` — name of the embedder's task adapter that was
 used to embed documents at pack time. Queries MUST be embedded under the
