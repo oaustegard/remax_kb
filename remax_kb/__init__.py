@@ -2,7 +2,7 @@
 
 from .manifest import Manifest, Embedder, Binarizer, CorpusInfo, Prompts
 from .read import KB
-from .pack import pack
+from .pack import pack, pack_directory
 
 __version__ = "0.1.0"
 
@@ -14,4 +14,5 @@ __all__ = [
     "CorpusInfo",
     "Prompts",
     "pack",
+    "pack_directory",
 ]

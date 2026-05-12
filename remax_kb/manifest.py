@@ -20,12 +20,16 @@ BINARIZER_KIND = "remax-centered-simhash"
 class Embedder:
     model_id: str
     model_revision: str
-    release_url: str
-    release_sha256: str
     task_adapter: str
     pooling: str
     normalize_l2: bool
     full_dim: int
+    # Optional for API-backed embedders (no runtime asset to fetch).
+    # When None, readers identify the embedder by model_id alone and skip
+    # the SHA256 verification step. The host-side embedder implementation
+    # is expected to talk to the upstream API directly.
+    release_url: str | None = None
+    release_sha256: str | None = None
 
 
 @dataclass
@@ -87,9 +91,15 @@ class Manifest:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Manifest":
+        emb = dict(d["embedder"])
+        # Tolerate empty-string legacy form for API-backed embedders too.
+        if emb.get("release_url") == "":
+            emb["release_url"] = None
+        if emb.get("release_sha256") == "":
+            emb["release_sha256"] = None
         return cls(
             spec_version=d["spec_version"],
-            embedder=Embedder(**d["embedder"]),
+            embedder=Embedder(**emb),
             prompts=Prompts(**d["prompts"]),
             binarizer=Binarizer(**d["binarizer"]),
             corpus=CorpusInfo(**d["corpus"]),

@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 
+from .handlers import DEFAULT_HANDLERS, FileHandler
 from .manifest import (
     BINARIZER_KIND,
     Binarizer,
@@ -88,6 +89,72 @@ def default_chunker(text: str, *, source_path: str, target_chars: int = 500) -> 
             flush()
     flush()
     return chunks
+
+
+def walk_directory(
+    root: str | Path,
+    *,
+    handlers: dict[str, FileHandler] | None = None,
+    pattern: str = "**/*",
+    chunker: Callable[[str, str], list[Chunk]] | None = None,
+) -> list[Chunk]:
+    """Walk a directory, dispatch each file to a handler keyed by suffix,
+    then chunk the extracted text.
+
+    Args:
+        root: Directory to walk. May also be a single file.
+        handlers: Suffix → ``FileHandler`` map. Defaults to
+            :data:`remax_kb.handlers.DEFAULT_HANDLERS`. Unknown suffixes
+            are silently skipped.
+        pattern: glob pattern relative to ``root`` (default: ``"**/*"``).
+        chunker: Override the default chunker. Signature
+            ``(text, source_path) -> list[Chunk]``. The default uses
+            :func:`default_chunker` with ``target_chars=500``.
+
+    Returns:
+        Flat list of chunks across all matched files, sorted by relative
+        path for determinism. Each chunk's ``meta`` is the union of the
+        file handler's metadata plus the chunker's own metadata; chunker
+        keys win on conflict.
+    """
+    root_path = Path(root)
+    if not root_path.exists():
+        raise FileNotFoundError(root_path)
+
+    use_handlers = handlers or DEFAULT_HANDLERS
+    use_chunker = chunker or (
+        lambda text, source_path: default_chunker(text, source_path=source_path)
+    )
+
+    if root_path.is_file():
+        files = [root_path]
+    else:
+        files = sorted(
+            p for p in root_path.glob(pattern)
+            if p.is_file() and p.suffix.lower() in use_handlers
+        )
+
+    out: list[Chunk] = []
+    for f in files:
+        ext = f.suffix.lower()
+        handler = use_handlers[ext]
+        try:
+            text, file_meta = handler(f)
+        except Exception as exc:  # noqa: BLE001 — handler failures shouldn't kill the run
+            import warnings as _w
+            _w.warn(f"handler for {f} raised {type(exc).__name__}: {exc}; skipping.", stacklevel=2)
+            continue
+        if not text.strip():
+            continue
+        rel = (
+            str(f.relative_to(root_path))
+            if root_path.is_dir()
+            else f.name
+        )
+        for chunk in use_chunker(text, rel):
+            merged = {**file_meta, **chunk.meta}
+            out.append(Chunk(id=chunk.id, text=chunk.text, meta=merged))
+    return out
 
 
 def walk_corpus(corpus_path: str | Path) -> list[Chunk]:
@@ -235,9 +302,9 @@ def pack(
         embedder=EmbedderField(
             model_id=fp["model_id"],
             model_revision=getattr(embedder, "model_revision", ""),
-            release_url=getattr(embedder, "release_url", ""),
-            release_sha256=getattr(embedder, "release_sha256", ""),
-            task_adapter=fp["task_adapter"],
+            release_url=getattr(embedder, "release_url", None) or None,
+            release_sha256=getattr(embedder, "release_sha256", None) or None,
+            task_adapter=fp.get("task_adapter", "retrieval"),
             pooling=fp["pooling"],
             normalize_l2=getattr(embedder, "normalize_l2", True),
             full_dim=full_dim,
@@ -270,3 +337,61 @@ def pack(
         zf.writestr("vectors.bin", vectors_bin)
         zf.writestr("chunks.jsonl", chunks_jsonl)
     return out_kb
+
+
+def pack_directory(
+    root: str | Path,
+    out_kb: str | Path,
+    *,
+    embedder,
+    handlers: dict[str, FileHandler] | None = None,
+    pattern: str = "**/*",
+    dim: int = 256,
+    k: int = 8,
+    seed: int = 0,
+    source_description: str = "",
+    batch_size: int = 16,
+    chunker: Callable[[str, str], list[Chunk]] | None = None,
+) -> Path:
+    """Pack a directory of mixed-format documents into a ``.kb``.
+
+    Convenience wrapper around :func:`walk_directory` + :func:`pack` for
+    the common "I have a folder of docs" case. Default handlers cover
+    ``.md / .markdown / .txt / .rst / .html / .htm / .pdf``. Override
+    by passing your own ``handlers`` dict; the default registry is
+    :data:`remax_kb.handlers.DEFAULT_HANDLERS`.
+
+    Args:
+        root: Directory of documents (or a single file).
+        out_kb: Destination ``.kb`` path.
+        embedder: Embedder exposing ``encode(texts, prompt=...)`` and
+            ``fingerprint()``.
+        handlers: Optional suffix → :data:`~remax_kb.handlers.FileHandler`
+            map. Defaults to :data:`~remax_kb.handlers.DEFAULT_HANDLERS`.
+        pattern: glob pattern (default ``"**/*"``).
+        dim, k, seed: Binarizer parameters (see :func:`pack`).
+        source_description: Free-text label baked into ``corpus.source``;
+            defaults to the absolute path of ``root``.
+        batch_size: Embedder mini-batch size.
+        chunker: Optional ``(text, source_path) -> list[Chunk]`` override.
+
+    Returns:
+        Path to the written ``.kb``.
+    """
+    chunks = walk_directory(
+        root, handlers=handlers, pattern=pattern, chunker=chunker
+    )
+    if not chunks:
+        raise ValueError(
+            f"no chunks produced from {root!r}; check handlers + pattern + corpus contents"
+        )
+    return pack(
+        chunks,
+        out_kb,
+        embedder=embedder,
+        dim=dim,
+        k=k,
+        seed=seed,
+        source_description=source_description or str(Path(root).resolve()),
+        batch_size=batch_size,
+    )
