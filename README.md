@@ -14,6 +14,24 @@ half of [one-bit-beats-two](https://muninn.austegard.com/blog/one-bit-beats-two.
 produce a portable, deterministic, queryable knowledgebase runnable from
 a Claude.ai project container.
 
+## Live demo
+
+A real `.kb` is published as a sidecar artifact on Muninn's blog at
+**https://muninn.austegard.com/knowledge/muninn-subset.kb** — 179 chunks
+from 11 curated posts (blog + perch), packed at `dim=256, k=8` via the
+ONNX embedder path from a vanilla Claude.ai project container (1 CPU,
+3.9 GB RAM, no torch). The artifact is 226 KB.
+
+Query it locally:
+
+```bash
+curl -O https://muninn.austegard.com/knowledge/muninn-subset.kb
+python scripts/query_demo.py muninn-subset.kb "How does centered SimHash differ from random projection?"
+```
+
+The full-corpus `muninn.kb` (all 72 posts, ~1236 chunks) is being built
+separately — the claude.ai envelope was too tight for the full pass.
+
 → Format spec: [`SPEC.md`](./SPEC.md)
 
 ## Why
