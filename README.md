@@ -21,8 +21,13 @@ make this practical at the size that small teams actually have.
 
 ## Live demos
 
-Two `.kb` files published as sidecar artifacts:
+Three `.kb` files published as sidecar artifacts:
 
+- **`muninn.kb`** — full muninn.austegard.com corpus: 1238 chunks
+  across 73 posts under `blog/`, `perch/`, `scratch/`. Hosted at
+  [muninn.austegard.com/knowledge/muninn.kb](https://muninn.austegard.com/knowledge/muninn.kb).
+  Same embedder/binarizer params as the subset; use this one for
+  realistic retrieval against the whole site.
 - **`muninn-subset.kb`** — 179 chunks from 11 curated personal-blog
   posts. Hosted at
   [muninn.austegard.com/knowledge/muninn-subset.kb](https://muninn.austegard.com/knowledge/muninn-subset.kb).
@@ -54,11 +59,11 @@ Two `.kb` files published as sidecar artifacts:
   > sitemap-driven and will work against docs.claude.com unchanged
   > once an SSR variant or a headless-browser fetcher is wired in.
 
-Query either one locally:
+Query any of them locally:
 
 ```bash
-curl -O https://muninn.austegard.com/knowledge/muninn-subset.kb
-remax-kb query muninn-subset.kb "How does centered SimHash differ from random projection?" --k 3
+curl -O https://muninn.austegard.com/knowledge/muninn.kb
+remax-kb query muninn.kb "How does centered SimHash differ from random projection?" --k 3
 ```
 
 → Format spec: [`SPEC.md`](./SPEC.md)
