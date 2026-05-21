@@ -60,13 +60,19 @@ manifest.json
 vectors.bin
 chunk_map.bin
 chunk_ids.bin
-bm25/index.npz
-bm25/vocab.json
-bm25/params.json
+bm25/data.csc.index.npy        (optional — see §bm25/)
+bm25/indices.csc.index.npy     (optional)
+bm25/indptr.csc.index.npy      (optional)
+bm25/params.index.json         (optional)
+bm25/vocab.index.json          (optional)
 ```
 
-A reader MUST refuse a `.kbi` missing any required entry. Unknown
-additional entries are ignored (forward-compatibility hint).
+A reader MUST refuse a `.kbi` missing any required non-`bm25/`
+entry. The `bm25/` subdirectory is collectively optional: either all
+five files MUST be present (lexical search supported) or none MUST
+be present (dense-only). Mixed states are an error.
+
+Unknown additional entries are ignored (forward-compatibility hint).
 
 ## `manifest.json`
 
@@ -229,20 +235,21 @@ display and back-linking by the application.
 
 ## `bm25/`
 
-Output of `bm25s.BM25.save(directory)`, captured as zip entries.
-v2.0 normalizes to three files:
+Output of `bm25s.BM25.save(directory)`. As of `bm25s==0.3.9` this
+emits five files:
 
-- `bm25/index.npz` — sparse postings matrix in numpy npz format
-- `bm25/vocab.json` — `{token: token_id}` mapping
-- `bm25/params.json` — `{"k1": ..., "b": ..., "tokenizer": ...}`
-  redundant with `manifest.json` but kept self-contained for tooling
-  that loads the bm25 subdir alone.
+- `bm25/data.csc.index.npy` — CSC sparse matrix values (float32)
+- `bm25/indices.csc.index.npy` — CSC row indices (int32)
+- `bm25/indptr.csc.index.npy` — CSC column pointers (int32)
+- `bm25/vocab.index.json` — `{token: token_id}` mapping
+- `bm25/params.index.json` — `{k1, b, delta, method, idf_method,
+  num_docs, ...}` self-contained for round-trip load
 
-Token IDs correspond to columns of the postings matrix. Rows of the
-postings matrix correspond to **non-tombstoned** rows of
-`chunk_map.bin`, in row-index order. The reader is responsible for
-mapping bm25 row indices back to absolute row indices using
-`chunk_map.bin` (skipping tombstones in the count).
+The CSC matrix has one column per vocabulary token and one row per
+indexed document. **Rows correspond to non-tombstoned chunk_map
+rows in row-index order.** The reader is responsible for mapping a
+BM25 doc index back to an absolute `chunk_map` row by skipping
+tombstones.
 
 A `.kbi` MAY omit the `bm25/` directory entirely. Readers MUST
 detect absence and gracefully degrade to dense-only search.
