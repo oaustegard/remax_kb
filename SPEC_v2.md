@@ -254,6 +254,40 @@ tombstones.
 A `.kbi` MAY omit the `bm25/` directory entirely. Readers MUST
 detect absence and gracefully degrade to dense-only search.
 
+
+
+## `binarizer/rotations.f32`
+
+**Optional.** Pre-computed Haar rotation matrices for the
+stacked-SimHash binarizer.
+
+Layout: `k × dim × dim` float32 little-endian values, concatenated.
+Total size: `k * dim * dim * 4` bytes. Rotation `j` of the k-stack
+occupies offset `j * dim * dim * 4` to `(j+1) * dim * dim * 4`,
+laid out row-major within each `(dim, dim)` matrix.
+
+This entry exists because bit-identical reproduction of NumPy's
+`SeedSequence` + Ziggurat-driven Gaussian sampling + LAPACK
+Householder QR in non-NumPy environments (e.g. JavaScript, WASM) is
+fragile in ways that produce silent retrieval-quality failures.
+Shipping the rotations sidesteps the problem at a fixed cost:
+
+| dim | k  | rotations size |
+|----:|---:|---------------:|
+| 256 |  8 |        2.0 MiB |
+| 384 |  4 |        2.3 MiB |
+| 768 |  4 |        9.0 MiB |
+
+This is **constant per binarizer configuration**, independent of
+corpus size. At ≥10K-chunk corpora the relative overhead is under
+20%; at 100K+ it's negligible.
+
+Readers that have a faithful NumPy-equivalent stack MAY ignore this
+entry and re-derive rotations from `(dim, k, seed)`. Readers in
+JavaScript and other environments where bit-fidelity is impractical
+MUST use this entry when present and MUST refuse to operate against
+a `.kbi` lacking it.
+
 ## `.kbc/shard-NNNN.bin`
 
 Flat byte concatenation, no header, no separators. Each chunk
