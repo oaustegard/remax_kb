@@ -351,6 +351,11 @@ class KBWriter:
             zf.writestr("vectors.bin", vectors_bytes)
             zf.writestr("chunk_map.bin", chunk_map_bytes)
             zf.writestr("chunk_ids.bin", chunk_ids_bytes)
+            # Pre-computed Haar rotations — see SPEC_v2 §binarizer/rotations.f32
+            from remax import StackedSignBitQuantizer
+            _q = StackedSignBitQuantizer(d=self._dim, k=self._k, seed=self._seed)
+            zf.writestr("binarizer/rotations.f32",
+                        _q.rotations_.astype("<f4").tobytes())
             if bm25_files is not None:
                 for name, data in bm25_files.items():
                     zf.writestr(f"bm25/{name}", data)
