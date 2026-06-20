@@ -19,6 +19,24 @@ The format itself is the demonstration that 1-bit codes (the rank-correct
 half of [one-bit-beats-two](https://muninn.austegard.com/blog/one-bit-beats-two.html))
 make this practical at the size that small teams actually have.
 
+## Format versions
+
+- **v1 `.kb`** ([`SPEC.md`](./SPEC.md)) — the original single-file
+  artifact: chunks + dense codes in one zip, dense Hamming top-k.
+  Stable and fully supported. The fastest path to ship one file.
+- **v2 `.kbi` + `.kbc/`** ([`SPEC_v2.md`](./SPEC_v2.md)) — a split
+  index built for static-CDN, mutable, hybrid-retrieval deployments
+  (the "search-on-mac" architecture). A hot `.kbi` (manifest +
+  vectors + BM25 postings, one GET) and a cold byte-addressable
+  `.kbc/` chunk store (one HTTP Range per hit). Adds BM25 + RRF
+  fusion, tombstone-based mutation, and per-chunk `sha256` + Merkle
+  verification.
+
+**New builds that need hybrid retrieval, mutation, or CDN range-fetch
+should target v2.** v1 remains the right choice for a single portable
+file you hand someone. Upgrade an existing v1 file with
+`remax-kb migrate` (no re-embedding — see Usage below).
+
 ## Live demos
 
 Three `.kb` files published as sidecar artifacts:
@@ -122,7 +140,35 @@ text with a warning rather than crashing on encrypted / scanned files.
 remax-kb query knowledge.kb "How does X work?" --k 5 --pretty
 ```
 
-### Inspect a `.kb` manifest
+`query` and `info` auto-detect the format, so the same commands work
+against a v2 `.kbi`:
+
+```bash
+remax-kb query knowledge.kbi "How does X work?" --k 5 --alpha 0.5  # weighted; omit for RRF
+remax-kb info knowledge.kbi
+```
+
+### Pack a v2 split index (`.kbi` + `.kbc/`)
+
+```bash
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --embedder gemini --gemini-dim 768
+```
+
+Writes `knowledge.kbi` (hot index) plus a sibling `knowledge.kbc/`
+(chunk shards) in the same directory.
+
+### Migrate a v1 `.kb` to v2
+
+```bash
+remax-kb migrate knowledge.kb --out ./out/ --name knowledge
+```
+
+Reuses the v1 dense codes verbatim (the v2 `vectors.bin` is
+byte-identical — no re-embedding, no embedder, no network), builds the
+BM25 index and the `.kbc/` chunk store fresh, and writes
+`out/knowledge.kbi` + `out/knowledge.kbc/`.
+
+### Inspect a `.kb` / `.kbi` manifest
 
 ```bash
 remax-kb info knowledge.kb
@@ -141,6 +187,27 @@ kb = KB.open(kb_path)
 hits = kb.search("How does X work?", embedder=emb, k=3)
 for dist, chunk in hits:
     print(f"[{chunk['id']}, hamming={dist}] {chunk['text'][:120]}...")
+```
+
+v2 split index (writer + hybrid reader):
+
+```python
+from remax_kb import KBWriter, KBv2, migrate_v1_to_v2
+from remax_kb.pack import walk_directory
+
+# Green-field v2 pack
+writer = KBWriter.create(name="knowledge", output_dir="./out", embedder=emb,
+                         dim=256, k=8, seed=0)
+writer.add_chunks(walk_directory("./my-docs/"))
+writer.commit()                      # writes out/knowledge.kbi + out/knowledge.kbc/
+
+# Or upgrade an existing v1 file (no re-embedding)
+migrate_v1_to_v2("knowledge.kb", "./out", name="knowledge")
+
+# Hybrid query
+kb = KBv2.open("./out/knowledge.kbi")
+for h in kb.search_and_fetch("How does X work?", embedder=emb, k=3):
+    print(f"[{h.chunk_id}, fused={h.fused:.4f}, verified={h.verified}] {h.text[:120]}...")
 ```
 
 ## Embedders
@@ -221,19 +288,24 @@ a build step:
 ```
 remax_kb/
 ├── README.md
-├── SPEC.md                         # the format spec — citable
+├── SPEC.md                         # the v1 format spec — citable
+├── SPEC_v2.md                      # the v2 split-index spec
 ├── LICENSE                         # MIT
 ├── pyproject.toml                  # registers `remax-kb` console script
 ├── requirements-build.txt          # remax + torch + transformers (packer)
 ├── requirements-runtime.txt        # onnxruntime + tokenizers + numpy (reader)
 ├── remax_kb/
 │   ├── __init__.py
-│   ├── manifest.py                 # dataclass + validation
+│   ├── manifest.py                 # v1 dataclass + validation
 │   ├── pack.py                     # corpus → .kb (pack, pack_directory)
 │   ├── read.py                     # .kb → in-memory index + search()
+│   ├── pack_v2.py                  # corpus → .kbi + .kbc/ (KBWriter)
+│   ├── read_v2.py                  # .kbi → hybrid retrieval (KBv2)
+│   ├── migrate.py                  # v1 .kb → v2 .kbi/.kbc (no re-embed)
+│   ├── formats.py                  # v1/v2 zip-layout detection
 │   ├── handlers.py                 # md/txt/html/pdf/rst extractors
 │   ├── embedders.py                # Jina ONNX/torch + Gemini wrappers
-│   ├── cli.py                      # `remax-kb pack|query|info` CLI
+│   ├── cli.py                      # `remax-kb pack|query|info|migrate` CLI
 │   └── _hamming.py                 # numpy popcount scan
 ├── skill/
 │   ├── SKILL.md
