@@ -2,16 +2,22 @@
 
 Subcommands:
 
-* ``pack`` — pack a directory of mixed-format documents into a ``.kb``.
-* ``query`` — open a ``.kb`` and run a query.
-* ``info`` — print the manifest of a ``.kb`` (no embedder needed).
+* ``pack`` — pack a directory of mixed-format documents into a ``.kb``
+  (v1, single zip) or, with ``--v2``, a split ``.kbi`` + ``.kbc/`` pair.
+* ``query`` — open a ``.kb``/``.kbi`` and run a query. The format is
+  auto-detected; v2 adds hybrid (dense + BM25) retrieval.
+* ``info`` — print the manifest of a ``.kb``/``.kbi`` (no embedder needed).
+* ``migrate`` — one-shot upgrade a v1 ``.kb`` to a v2 ``.kbi`` + ``.kbc/``
+  (no embedder, no re-embedding).
 
 Examples::
 
     remax-kb pack ./docs/ -o knowledge.kb --dim 256 --k 8 --embedder jina-onnx
-    remax-kb pack ./docs/ -o knowledge.kb --embedder gemini --gemini-dim 768
+    remax-kb pack ./docs/ -o knowledge.kbi --v2 --embedder gemini --gemini-dim 768
     remax-kb query knowledge.kb "How does X work?" --k 5
-    remax-kb info knowledge.kb
+    remax-kb query knowledge.kbi "How does X work?" --k 5 --alpha 0.5
+    remax-kb info knowledge.kbi
+    remax-kb migrate knowledge.kb --out ./out/ --name knowledge
 """
 from __future__ import annotations
 
@@ -19,6 +25,8 @@ import argparse
 import json
 import sys
 from pathlib import Path
+
+from .formats import detect_format
 
 
 def _build_embedder(name: str, args: argparse.Namespace):
@@ -44,7 +52,13 @@ def _build_embedder(name: str, args: argparse.Namespace):
     )
 
 
+# --------------------------------------------------------------------------- #
+# pack
+# --------------------------------------------------------------------------- #
 def _cmd_pack(args: argparse.Namespace) -> int:
+    if args.v2:
+        return _cmd_pack_v2(args)
+
     from . import pack_directory
 
     embedder = _build_embedder(args.embedder, args)
@@ -64,7 +78,47 @@ def _cmd_pack(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_pack_v2(args: argparse.Namespace) -> int:
+    from .pack import walk_directory
+    from .pack_v2 import KBWriter
+
+    out_path = Path(args.out)
+    name = out_path.stem
+    output_dir = out_path.parent if out_path.parent != Path("") else Path(".")
+
+    embedder = _build_embedder(args.embedder, args)
+    chunks = walk_directory(args.corpus, pattern=args.pattern)
+    if not chunks:
+        print("no chunks produced from corpus", file=sys.stderr)
+        return 1
+
+    writer = KBWriter.create(
+        name=name,
+        output_dir=output_dir,
+        embedder=embedder,
+        dim=args.dim,
+        k=args.k,
+        seed=args.seed,
+        source=args.source,
+    )
+    writer.add_chunks(chunks)
+    writer.commit()
+
+    kbi = output_dir / f"{name}.kbi"
+    kbc = output_dir / f"{name}.kbc"
+    size = kbi.stat().st_size
+    print(f"wrote {kbi} ({size / 1024:.1f} KB) + {kbc}/ ({len(chunks)} chunks)")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# query
+# --------------------------------------------------------------------------- #
 def _cmd_query(args: argparse.Namespace) -> int:
+    fmt = detect_format(args.kb)
+    if fmt == "2":
+        return _cmd_query_v2(args)
+
     from . import KB
 
     embedder = _build_embedder(args.embedder, args)
@@ -72,6 +126,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
     hits = kb.search(args.query, embedder=embedder, k=args.k)
     payload = {
         "kb": str(Path(args.kb).resolve()),
+        "spec_version": "1",
         "query": args.query,
         "hits": [
             {
@@ -87,7 +142,43 @@ def _cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_query_v2(args: argparse.Namespace) -> int:
+    from .read_v2 import KB as KBv2
+
+    embedder = _build_embedder(args.embedder, args)
+    kb = KBv2.open(args.kb)
+    hits = kb.search_and_fetch(args.query, embedder=embedder, k=args.k, alpha=args.alpha)
+    payload = {
+        "kb": str(Path(args.kb).resolve()),
+        "spec_version": "2",
+        "query": args.query,
+        "fusion": "weighted" if args.alpha is not None else "rrf",
+        "hits": [
+            {
+                "id": h.chunk_id,
+                "dense_distance": h.dense_dist,
+                "dense_sim": h.dense_sim,
+                "bm25_score": h.bm25_score,
+                "fused": h.fused,
+                "verified": h.verified,
+                "text": h.text,
+                "meta": h.meta,
+            }
+            for h in hits
+        ],
+    }
+    print(json.dumps(payload, indent=2 if args.pretty else None, ensure_ascii=False))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# info
+# --------------------------------------------------------------------------- #
 def _cmd_info(args: argparse.Namespace) -> int:
+    fmt = detect_format(args.kb)
+    if fmt == "2":
+        return _cmd_info_v2(args)
+
     from . import KB
 
     kb = KB.open(args.kb)
@@ -116,6 +207,69 @@ def _cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_info_v2(args: argparse.Namespace) -> int:
+    from .read_v2 import KB as KBv2
+
+    kb = KBv2.open(args.kb)
+    m = kb.manifest
+    payload = {
+        "path": str(Path(args.kb).resolve()),
+        "spec_version": m["spec_version"],
+        "version": m.get("version"),
+        "kind": m.get("kind"),
+        "built_at": m.get("built_at"),
+        "source": m.get("source", ""),
+        "chunks": {
+            "live_count": m["chunks"]["live_count"],
+            "total_rows": m["chunks"]["total_rows"],
+            "shard_count": m["chunks"]["shard_count"],
+            "merkle_root": m["chunks"]["merkle_root"],
+        },
+        "embedder": {
+            "model_id": m["embedder"]["model_id"],
+            "task_adapter": m["embedder"]["task_adapter"],
+            "pooling": m["embedder"]["pooling"],
+            "full_dim": m["embedder"]["full_dim"],
+            "release_url": m["embedder"].get("release_url"),
+        },
+        "binarizer": {
+            "kind": m["binarizer"]["kind"],
+            "dim": m["binarizer"]["dim"],
+            "k": m["binarizer"]["k"],
+            "seed": m["binarizer"]["seed"],
+        },
+        "lexical": m.get("lexical"),
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# migrate
+# --------------------------------------------------------------------------- #
+def _cmd_migrate(args: argparse.Namespace) -> int:
+    from .migrate import migrate_v1_to_v2
+
+    fmt = detect_format(args.kb)
+    if fmt != "1":
+        print(f"{args.kb} is already spec v{fmt}; nothing to migrate", file=sys.stderr)
+        return 1
+
+    kbi, kbc = migrate_v1_to_v2(
+        args.kb,
+        args.out,
+        name=args.name,
+        shard_max_bytes=args.shard_max_bytes,
+    )
+    size = kbi.stat().st_size
+    shard_count = len(sorted(kbc.glob("shard-*.bin"))) if kbc.exists() else 0
+    print(f"wrote {kbi} ({size / 1024:.1f} KB) + {kbc}/ ({shard_count} shard(s))")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# argument wiring
+# --------------------------------------------------------------------------- #
 def _embedder_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--embedder",
@@ -149,29 +303,48 @@ def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="remax-kb", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    pack_p = sub.add_parser("pack", help="pack a directory into a .kb")
+    pack_p = sub.add_parser("pack", help="pack a directory into a .kb / .kbi")
     pack_p.add_argument("corpus", help="directory of documents (or a single file)")
-    pack_p.add_argument("-o", "--out", required=True, help="destination .kb path")
+    pack_p.add_argument("-o", "--out", required=True, help="destination .kb (v1) or .kbi (v2) path")
+    pack_p.add_argument("--v2", action="store_true", help="emit a split .kbi + .kbc/ (spec v2)")
     pack_p.add_argument("--pattern", default="**/*", help='glob (default: "**/*")')
     pack_p.add_argument("--dim", type=int, default=256, help="binarizer dim (default 256)")
     pack_p.add_argument("--k", type=int, default=8, help="stacked-SimHash stack count (default 8)")
     pack_p.add_argument("--seed", type=int, default=0, help="RNG seed (default 0)")
     pack_p.add_argument("--source", default="", help="free-text source description")
-    pack_p.add_argument("--batch-size", type=int, default=16, help="embed batch size")
+    pack_p.add_argument("--batch-size", type=int, default=16, help="(v1 only) embed batch size")
     _embedder_args(pack_p)
     pack_p.set_defaults(func=_cmd_pack)
 
-    q_p = sub.add_parser("query", help="query a .kb")
-    q_p.add_argument("kb", help="path to .kb")
+    q_p = sub.add_parser("query", help="query a .kb / .kbi (format auto-detected)")
+    q_p.add_argument("kb", help="path to .kb (v1) or .kbi (v2)")
     q_p.add_argument("query", help="user query string")
     q_p.add_argument("--k", type=int, default=5, help="number of results")
+    q_p.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="(v2 only) fusion weight; omit for RRF, set 0..1 for weighted dense/lexical",
+    )
     q_p.add_argument("--pretty", action="store_true", help="indent JSON output")
     _embedder_args(q_p)
     q_p.set_defaults(func=_cmd_query)
 
-    i_p = sub.add_parser("info", help="print manifest summary")
-    i_p.add_argument("kb", help="path to .kb")
+    i_p = sub.add_parser("info", help="print manifest summary (format auto-detected)")
+    i_p.add_argument("kb", help="path to .kb (v1) or .kbi (v2)")
     i_p.set_defaults(func=_cmd_info)
+
+    mig_p = sub.add_parser("migrate", help="upgrade a v1 .kb to a v2 .kbi + .kbc/")
+    mig_p.add_argument("kb", help="path to the source v1 .kb")
+    mig_p.add_argument("--out", required=True, help="output directory for <name>.kbi + <name>.kbc/")
+    mig_p.add_argument("--name", default=None, help="artifact base name (default: source stem)")
+    mig_p.add_argument(
+        "--shard-max-bytes",
+        type=int,
+        default=None,
+        help="shard rotation cap in bytes (default: 20 MiB)",
+    )
+    mig_p.set_defaults(func=_cmd_migrate)
 
     return ap
 

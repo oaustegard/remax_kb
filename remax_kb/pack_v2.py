@@ -220,6 +220,49 @@ class KBWriter:
         self._committed = True
 
     # ------------------------------------------------------------------ #
+    # Migration ingest (pre-computed codes, no embedder)
+    # ------------------------------------------------------------------ #
+    def ingest_precoded(
+        self,
+        chunks: list[Chunk],
+        codes: np.ndarray,
+        *,
+        mean_vector: np.ndarray,
+    ) -> None:
+        """Materialize a green-field `.kbi` + `.kbc/` from chunks whose binary
+        codes were computed elsewhere — e.g. the v1→v2 migration path, where
+        v1's ``vectors.bin`` is reused verbatim instead of re-embedding.
+
+        ``codes`` must be ``(N, row_bytes)`` uint8 consistent with this
+        writer's ``(dim, k, seed)``, in the same row order as ``chunks``.
+        ``mean_vector`` is the frozen corpus mean carried over from the source
+        artifact. Single-shot: writes the artifacts and marks the writer
+        committed. Only valid on a fresh writer (no prior rows/commit).
+        """
+        if self._committed or self._rows:
+            raise RuntimeError("ingest_precoded() is only valid on a fresh writer")
+        codes = np.ascontiguousarray(codes, dtype=np.uint8)
+        if codes.ndim != 2 or codes.shape[0] != len(chunks):
+            raise ValueError(
+                f"codes shape {codes.shape} does not match {len(chunks)} chunks"
+            )
+        expected_row_bytes = self._dim * self._k // 8
+        if codes.shape[1] != expected_row_bytes:
+            raise ValueError(
+                f"codes row width {codes.shape[1]} != dim*k/8 = {expected_row_bytes}"
+            )
+        if not chunks:
+            raise ValueError("ingest_precoded() called with no chunks")
+
+        self._mean_vector = np.ascontiguousarray(mean_vector, dtype="<f4")
+        self._pending_adds = list(chunks)
+        self._append_pending(codes)
+        self._pending_adds = []
+        self._version += 1
+        self._write_artifacts()
+        self._committed = True
+
+    # ------------------------------------------------------------------ #
     # Compact (v2.1)
     # ------------------------------------------------------------------ #
     def compact(self) -> None:

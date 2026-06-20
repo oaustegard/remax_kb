@@ -185,3 +185,77 @@ def test_cli_unknown_embedder_exits(corpus_dir: Path, tmp_path: Path):
             "pack", str(corpus_dir), "-o", str(tmp_path / "x.kb"),
             "--embedder", "nope",
         ])
+
+
+# --------------------------------------------------------------------------- #
+# v2 surface: pack --v2, auto-detecting query/info, migrate
+# --------------------------------------------------------------------------- #
+def test_cli_pack_v2_and_query_autodetect(stub_embedder, corpus_dir: Path, tmp_path: Path, capsys):
+    out = tmp_path / "out.kbi"
+    rc = stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0"]
+    )
+    assert rc == 0
+    assert out.exists()
+    assert (tmp_path / "out.kbc").is_dir()
+    capsys.readouterr()
+
+    # query auto-detects v2 → hybrid output shape (no v1 "distance" key)
+    rc = stub_embedder.main(
+        ["query", str(out), "cats purring", "--k", "1", "--embedder", "stub"]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["spec_version"] == "2"
+    assert payload["fusion"] == "rrf"
+    assert len(payload["hits"]) == 1
+    hit = payload["hits"][0]
+    assert "id" in hit and "fused" in hit and "verified" in hit
+    assert hit["verified"] is True
+
+
+def test_cli_info_autodetects_v2(stub_embedder, corpus_dir: Path, tmp_path: Path, capsys):
+    out = tmp_path / "out.kbi"
+    stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0"]
+    )
+    capsys.readouterr()
+
+    rc = stub_embedder.main(["info", str(out)])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["spec_version"] == "2"
+    assert payload["kind"] == "split-index"
+    assert payload["chunks"]["live_count"] > 0
+    assert payload["embedder"]["model_id"] == StubEmbedder.model_id
+
+
+def test_cli_migrate_v1_to_v2(stub_embedder, corpus_dir: Path, tmp_path: Path, capsys):
+    v1 = tmp_path / "legacy.kb"
+    stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(v1), "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0"]
+    )
+    capsys.readouterr()
+
+    out_dir = tmp_path / "migrated"
+    rc = stub_embedder.main(["migrate", str(v1), "--out", str(out_dir), "--name", "legacy"])
+    assert rc == 0
+    assert (out_dir / "legacy.kbi").is_file()
+    assert (out_dir / "legacy.kbc").is_dir()
+    assert "wrote" in capsys.readouterr().out
+
+
+def test_cli_migrate_rejects_v2_input(stub_embedder, corpus_dir: Path, tmp_path: Path, capsys):
+    out = tmp_path / "out.kbi"
+    stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0"]
+    )
+    capsys.readouterr()
+
+    rc = stub_embedder.main(["migrate", str(out), "--out", str(tmp_path / "x")])
+    assert rc == 1
+    assert "already spec v2" in capsys.readouterr().err
