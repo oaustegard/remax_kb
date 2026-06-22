@@ -112,6 +112,63 @@ def _cmd_pack_v2(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# sync — incremental v2 (re)build
+# --------------------------------------------------------------------------- #
+def _cmd_sync(args: argparse.Namespace) -> int:
+    from .pack import walk_directory
+    from .pack_v2 import KBWriter
+
+    out_path = Path(args.out)
+    if out_path.suffix != ".kbi":
+        print(f"sync targets a v2 .kbi; got {out_path.name!r}", file=sys.stderr)
+        return 2
+    name = out_path.stem
+    output_dir = out_path.parent if out_path.parent != Path("") else Path(".")
+
+    chunks = walk_directory(args.corpus, pattern=args.pattern)
+    if not chunks:
+        print("no chunks produced from corpus", file=sys.stderr)
+        return 1
+
+    embedder = _build_embedder(args.embedder, args)
+    if out_path.exists():
+        writer = KBWriter.open(name=name, output_dir=output_dir, embedder=embedder)
+    else:
+        writer = KBWriter.create(
+            name=name,
+            output_dir=output_dir,
+            embedder=embedder,
+            dim=args.dim,
+            k=args.k,
+            seed=args.seed,
+            source=args.source,
+        )
+
+    stats = writer.sync(chunks)
+    writer.commit()
+
+    compacted = False
+    if not args.no_compact and writer.should_compact(args.compact_threshold):
+        writer.compact()
+        compacted = True
+
+    payload = {
+        "kb": str(out_path.resolve()),
+        "added": stats.added,
+        "updated": stats.updated,
+        "deleted": stats.deleted,
+        "unchanged": stats.unchanged,
+        "embedded": stats.embedded,
+        "live_count": writer.live_count,
+        "total_rows": writer.total_rows,
+        "tombstone_ratio": round(writer.tombstone_ratio, 4),
+        "compacted": compacted,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # query
 # --------------------------------------------------------------------------- #
 def _cmd_query(args: argparse.Namespace) -> int:
@@ -315,6 +372,26 @@ def _build_parser() -> argparse.ArgumentParser:
     pack_p.add_argument("--batch-size", type=int, default=16, help="(v1 only) embed batch size")
     _embedder_args(pack_p)
     pack_p.set_defaults(func=_cmd_pack)
+
+    sync_p = sub.add_parser(
+        "sync", help="incrementally (re)build a v2 .kbi from a directory (embeds only the delta)"
+    )
+    sync_p.add_argument("corpus", help="directory of documents (or a single file)")
+    sync_p.add_argument("-o", "--out", required=True, help="destination .kbi (created if absent)")
+    sync_p.add_argument("--pattern", default="**/*", help='glob (default: "**/*")')
+    sync_p.add_argument("--dim", type=int, default=256, help="(create only) binarizer dim")
+    sync_p.add_argument("--k", type=int, default=8, help="(create only) stacked-SimHash stack count")
+    sync_p.add_argument("--seed", type=int, default=0, help="(create only) RNG seed")
+    sync_p.add_argument("--source", default="", help="(create only) free-text source description")
+    sync_p.add_argument(
+        "--compact-threshold", type=float, default=0.2,
+        help="compact after sync when tombstone ratio exceeds this (default 0.2)",
+    )
+    sync_p.add_argument(
+        "--no-compact", action="store_true", help="never auto-compact, regardless of ratio",
+    )
+    _embedder_args(sync_p)
+    sync_p.set_defaults(func=_cmd_sync)
 
     q_p = sub.add_parser("query", help="query a .kb / .kbi (format auto-detected)")
     q_p.add_argument("kb", help="path to .kb (v1) or .kbi (v2)")
