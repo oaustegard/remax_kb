@@ -4,9 +4,11 @@
 // Zero external dependencies: rolls its own ZIP_STORED reader, NPY parser,
 // Hamming popcount, BM25 scoring, and stacked-SimHash query encoder.
 //
-// Requires the .kbi to include `binarizer/rotations.f32` (see SPEC_v2
-// §binarizer/rotations.f32). Throws on absence — bit-fidelity with
-// NumPy's QR is impractical without the shipped rotations.
+// Requires the .kbi to ship its rotations — either `binarizer/rotations.f32`
+// or `binarizer/rotations.i8` + `binarizer/rotations.scale.f32` when
+// `binarizer.rotations_quant == "int8"` (see SPEC_v2 §binarizer/rotations).
+// Throws on absence — bit-fidelity with NumPy's QR is impractical without
+// the shipped rotations.
 
 // ─────────────────────────────────────────────────────────────────────────
 // Constants
@@ -305,9 +307,10 @@ export class KBReader {
   constructor(kbiBytes, chunksBaseUri) {
     const zip = new ZipStored(kbiBytes);
 
-    // Required entries
+    // Required entries (the rotation sidecar is validated below, per
+    // binarizer.rotations_quant — f32 vs int8 ship different files).
     for (const name of ["manifest.json", "vectors.bin", "chunk_map.bin",
-                        "chunk_ids.bin", "binarizer/rotations.f32"]) {
+                        "chunk_ids.bin"]) {
       if (!zip.has(name)) {
         throw new Error(`kb-reader: missing required entry ${name}`);
       }
@@ -337,16 +340,56 @@ export class KBReader {
       );
     }
 
-    // Rotations
-    const rotBytes = zip.read("binarizer/rotations.f32");
-    const rotAligned = rotBytes.slice();
-    this._rotations = new Float32Array(
-      rotAligned.buffer,
-      rotAligned.byteOffset,
-      this._k * this._dim * this._dim
-    );
-    if (this._rotations.length !== this._k * this._dim * this._dim) {
-      throw new Error("kb-reader: rotations size mismatch");
+    // Rotations — f32 sidecar, or int8 + per-output-column scale.
+    // See SPEC_v2 §binarizer/rotations.i8. The corpus is packed against the
+    // dequantized rotations, so we dequantize and use these exactly (never
+    // re-derive from seed).
+    const nRot = this._k * this._dim * this._dim;
+    const rotQuant = bin.rotations_quant || "float32";
+    if (rotQuant === "int8") {
+      if (!zip.has("binarizer/rotations.i8") ||
+          !zip.has("binarizer/rotations.scale.f32")) {
+        throw new Error(
+          "kb-reader: rotations_quant=int8 but rotations.i8/scale.f32 missing"
+        );
+      }
+      const i8u = zip.read("binarizer/rotations.i8").slice();
+      const i8 = new Int8Array(i8u.buffer, i8u.byteOffset, i8u.length);
+      const scAligned = zip.read("binarizer/rotations.scale.f32").slice();
+      const scale = new Float32Array(
+        scAligned.buffer, scAligned.byteOffset, this._k * this._dim
+      );
+      if (i8.length !== nRot) {
+        throw new Error("kb-reader: rotations.i8 size mismatch");
+      }
+      if (scale.length !== this._k * this._dim) {
+        throw new Error("kb-reader: rotations.scale.f32 size mismatch");
+      }
+      // Dequant: Q[j, row, col] = i8[j, row, col] * scale[j, col]
+      const rot = new Float32Array(nRot);
+      const d = this._dim;
+      for (let j = 0; j < this._k; j++) {
+        const base = j * d * d;
+        const sBase = j * d;
+        for (let row = 0; row < d; row++) {
+          const rBase = base + row * d;
+          for (let col = 0; col < d; col++) {
+            rot[rBase + col] = i8[rBase + col] * scale[sBase + col];
+          }
+        }
+      }
+      this._rotations = rot;
+    } else {
+      if (!zip.has("binarizer/rotations.f32")) {
+        throw new Error("kb-reader: missing required entry binarizer/rotations.f32");
+      }
+      const rotAligned = zip.read("binarizer/rotations.f32").slice();
+      this._rotations = new Float32Array(
+        rotAligned.buffer, rotAligned.byteOffset, nRot
+      );
+      if (this._rotations.length !== nRot) {
+        throw new Error("kb-reader: rotations size mismatch");
+      }
     }
 
     // Vectors
