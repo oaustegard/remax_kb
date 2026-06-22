@@ -77,15 +77,21 @@ class KBWriter:
         bm25_b: float = DEFAULT_BM25_B,
         chunks_uri: str | None = None,
         source: str = "",
+        rotations_quant: str = "float32",
     ):
         if dim % 8 != 0:
             raise ValueError(f"dim must be a multiple of 8, got {dim}")
+        if rotations_quant not in ("float32", "int8"):
+            raise ValueError(f"rotations_quant must be 'float32' or 'int8', got {rotations_quant!r}")
         self._name = name
         self._output_dir = Path(output_dir)
         self._embedder = embedder
         self._dim = dim
         self._k = k
         self._seed = seed
+        self._rotations_quant = rotations_quant
+        self._quantizer_obj = None       # cached StackedSignBitQuantizer
+        self._rotations_i8 = None        # (codes_i8, scale_f32) when int8
         self._shard_max = shard_max_bytes
         self._bm25_k1 = bm25_k1
         self._bm25_b = bm25_b
@@ -199,9 +205,7 @@ class KBWriter:
 
             centered = new_embeddings - self._mean_vector
             truncated = centered[:, : self._dim].astype(np.float32)
-            from remax import StackedSignBitQuantizer
-            quantizer = StackedSignBitQuantizer(d=self._dim, k=self._k, seed=self._seed)
-            new_codes = quantizer.encode(truncated)  # (N, rowBytes) uint8
+            new_codes = self._get_quantizer().encode(truncated)  # (N, rowBytes) uint8
 
             # Append shard bytes + chunk_ids + rows
             self._append_pending(new_codes)
@@ -366,6 +370,24 @@ class KBWriter:
     # ------------------------------------------------------------------ #
     # Internal: write artifacts
     # ------------------------------------------------------------------ #
+    def _get_quantizer(self):
+        """StackedSignBitQuantizer used to encode docs AND queries, cached so
+        ``commit()`` and ``_write_artifacts()`` share one rotation set. When
+        ``rotations_quant == 'int8'`` its rotations are the int8-dequantized
+        form, so the corpus codes and the shipped int8 rotations are
+        bit-consistent (a reader that dequantizes lands in the same sign-space).
+        """
+        if self._quantizer_obj is None:
+            from remax import StackedSignBitQuantizer
+            q = StackedSignBitQuantizer(d=self._dim, k=self._k, seed=self._seed)
+            if self._rotations_quant == "int8":
+                from .rotations import quantize_int8, dequantize_int8
+                codes_i8, scale_f32 = quantize_int8(q.rotations_.astype(np.float32))
+                q.rotations_ = dequantize_int8(codes_i8, scale_f32).astype(q.dtype)
+                self._rotations_i8 = (codes_i8, scale_f32)
+            self._quantizer_obj = q
+        return self._quantizer_obj
+
     def _write_artifacts(self) -> None:
         vectors_bytes = b"".join(v.tobytes() for v in self._vectors)
         chunk_map_bytes = b"".join(r.pack() for r in self._rows)
@@ -394,11 +416,18 @@ class KBWriter:
             zf.writestr("vectors.bin", vectors_bytes)
             zf.writestr("chunk_map.bin", chunk_map_bytes)
             zf.writestr("chunk_ids.bin", chunk_ids_bytes)
-            # Pre-computed Haar rotations — see SPEC_v2 §binarizer/rotations.f32
-            from remax import StackedSignBitQuantizer
-            _q = StackedSignBitQuantizer(d=self._dim, k=self._k, seed=self._seed)
-            zf.writestr("binarizer/rotations.f32",
-                        _q.rotations_.astype("<f4").tobytes())
+            # Pre-computed Haar rotations — see SPEC_v2 §binarizer/rotations.
+            # f32 by default; int8 + per-column scale when rotations_quant set.
+            q = self._get_quantizer()
+            if self._rotations_quant == "int8":
+                codes_i8, scale_f32 = self._rotations_i8
+                zf.writestr("binarizer/rotations.i8",
+                            np.ascontiguousarray(codes_i8, dtype=np.int8).tobytes())
+                zf.writestr("binarizer/rotations.scale.f32",
+                            np.ascontiguousarray(scale_f32, dtype="<f4").tobytes())
+            else:
+                zf.writestr("binarizer/rotations.f32",
+                            q.rotations_.astype("<f4").tobytes())
             if bm25_files is not None:
                 for name, data in bm25_files.items():
                     zf.writestr(f"bm25/{name}", data)
@@ -465,6 +494,7 @@ class KBWriter:
                 "dim": self._dim,
                 "k": self._k,
                 "seed": self._seed,
+                "rotations_quant": self._rotations_quant,
                 "mean_vector_b64": _np_to_b64(self._mean_vector),
             },
             "chunks": {
@@ -512,6 +542,8 @@ class KBWriter:
         self._dim = manifest["binarizer"]["dim"]
         self._k = manifest["binarizer"]["k"]
         self._seed = manifest["binarizer"]["seed"]
+        # Preserve rotation quantization across mutation re-commits.
+        self._rotations_quant = manifest["binarizer"].get("rotations_quant", "float32")
         self._mean_vector = _b64_to_np(manifest["binarizer"]["mean_vector_b64"])
         self._version = manifest["version"]
         self._chunk_ids_bytes = bytearray(chunk_ids)

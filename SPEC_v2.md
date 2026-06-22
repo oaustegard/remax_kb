@@ -140,7 +140,10 @@ clients to detect updates without re-parsing the body.
 
 `prompts.*` — identical semantics to v1.
 
-`binarizer.*` — identical semantics to v1.
+`binarizer.*` — identical semantics to v1, plus the optional
+`binarizer.rotations_quant` (`"float32"` default, or `"int8"`) which
+selects how the rotation sidecar is stored — see
+`binarizer/rotations.i8` below.
 
 `lexical.kind` — `"bm25s"` for v2. Other lexical scorers may be
 added under new kinds. Optional: omit the `lexical` block entirely
@@ -287,6 +290,42 @@ entry and re-derive rotations from `(dim, k, seed)`. Readers in
 JavaScript and other environments where bit-fidelity is impractical
 MUST use this entry when present and MUST refuse to operate against
 a `.kbi` lacking it.
+
+## `binarizer/rotations.i8` + `binarizer/rotations.scale.f32`
+
+**Optional, int8-quantized alternative to `rotations.f32`.** Selected at
+pack time via `binarizer.rotations_quant == "int8"` (default
+`"float32"`). When present, `rotations.f32` is absent and these two
+entries replace it.
+
+The rotations feed only a sign test (`x·Q ≥ 0`), so f32 precision is
+unnecessary. Quantizing to int8 with a per-output-column scale shrinks
+the sidecar **4×** (`k·dim²` bytes + `k·dim·4` bytes of scale) while
+flipping a negligible fraction of code bits (~0.24% on a real
+768-d/k=2 corpus, with no measurable recall loss).
+
+Layout:
+
+- `rotations.i8` — `k × dim × dim` **int8** values, same C-order
+  (row-major) element order as `rotations.f32`.
+- `rotations.scale.f32` — `k × dim` float32 little-endian, one scale per
+  `(stack j, output column e)`.
+
+Dequantize before use: `Q[j, d, e] = i8[j, d, e] * scale[j, e]`. The
+column axis `e` is the projection output (hyperplane index); the scale
+is `max_d |Q[j, d, e]| / 127` per column, clamped away from zero.
+
+A reader that encounters `rotations_quant == "int8"` MUST dequantize
+these entries and MUST NOT re-derive rotations from `(dim, k, seed)`:
+the corpus codes were packed against the **dequantized** rotations, so
+re-deriving the exact f32 matrices would land queries in a slightly
+different sign-space. Per-config sizes:
+
+| dim | k  | f32 sidecar | int8 sidecar |
+|----:|---:|------------:|-------------:|
+| 256 |  8 |     2.0 MiB |      0.5 MiB |
+| 512 |  4 |     4.0 MiB |      1.0 MiB |
+| 768 |  2 |     4.5 MiB |      1.1 MiB |
 
 ## `.kbc/shard-NNNN.bin`
 

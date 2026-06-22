@@ -58,6 +58,7 @@ class KB:
         bm25_retriever: bm25s.BM25 | None,
         chunks_uri: str,
         row_of_live: dict[int, int] | None,  # bm25 doc idx → absolute row
+        deq_rotations: np.ndarray | None = None,  # (k,dim,dim) f32 when int8-packed
     ):
         self._m = manifest
         self._vectors = vectors
@@ -66,6 +67,7 @@ class KB:
         self._bm25 = bm25_retriever
         self._chunks_uri = chunks_uri
         self._row_of_live = row_of_live or {}
+        self._deq_rotations = deq_rotations
 
         b = manifest["binarizer"]
         self._dim = b["dim"]
@@ -114,6 +116,22 @@ class KB:
                 if missing:
                     raise ValueError(f"partial bm25/ subdir; missing {missing}")
                 bm25_retriever = _load_bm25_from_zip(zf)
+
+            # int8-quantized rotations (optional). Legacy f32 / no-rotations
+            # readers recompute from (dim,k,seed); int8 must be dequantized
+            # from the shipped sidecar so codes and query land in one space.
+            deq_rotations = None
+            _bq = manifest.get("binarizer", {})
+            if _bq.get("rotations_quant") == "int8":
+                if {"binarizer/rotations.i8", "binarizer/rotations.scale.f32"} - names:
+                    raise ValueError("rotations_quant=int8 but rotations.i8/scale.f32 missing")
+                _dim, _k = _bq["dim"], _bq["k"]
+                _i8 = np.frombuffer(zf.read("binarizer/rotations.i8"),
+                                    dtype=np.int8).reshape(_k, _dim, _dim)
+                _scale = np.frombuffer(zf.read("binarizer/rotations.scale.f32"),
+                                       dtype="<f4").reshape(_k, _dim)
+                from .rotations import dequantize_int8
+                deq_rotations = dequantize_int8(_i8, _scale)
 
         # Validate
         if manifest["spec_version"] != SPEC_VERSION:
@@ -166,6 +184,7 @@ class KB:
             bm25_retriever=bm25_retriever,
             chunks_uri=chunks_uri,
             row_of_live=row_of_live,
+            deq_rotations=deq_rotations,
         )
 
     # ------------------------------------------------------------------ #
@@ -244,6 +263,10 @@ class KB:
         truncated = centered[: self._dim]
         from remax import StackedSignBitQuantizer
         q_quant = StackedSignBitQuantizer(d=self._dim, k=self._k, seed=self._seed)
+        if self._deq_rotations is not None:
+            # int8-packed: encode the query with the same dequantized rotations
+            # the corpus was packed against (not the exact f32 recompute).
+            q_quant.rotations_ = self._deq_rotations.astype(q_quant.dtype)
         q_code = q_quant.encode(truncated[None, :])[0]  # (row_bytes,) uint8
 
         # Hamming scan, skipping tombstones
