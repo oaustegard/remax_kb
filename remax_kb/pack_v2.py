@@ -163,6 +163,39 @@ class KBWriter:
         return self._kbc_dir / f"shard-{shard_id:04d}.bin"
 
     # ------------------------------------------------------------------ #
+    # Corpus state / compaction policy
+    # ------------------------------------------------------------------ #
+    @property
+    def total_rows(self) -> int:
+        """Rows on disk including tombstones (committed + applied)."""
+        return len(self._rows)
+
+    @property
+    def live_count(self) -> int:
+        """Non-tombstoned rows."""
+        return sum(1 for r in self._rows if not (r.flags & FLAG_TOMBSTONE))
+
+    @property
+    def tombstone_count(self) -> int:
+        return self.total_rows - self.live_count
+
+    @property
+    def tombstone_ratio(self) -> float:
+        """Fraction of rows that are tombstones; 0.0 for an empty writer."""
+        return self.tombstone_count / self.total_rows if self.total_rows else 0.0
+
+    def should_compact(self, max_tombstone_ratio: float = 0.2) -> bool:
+        """Whether dead weight warrants a compaction.
+
+        Incremental sync never reclaims tombstoned bytes and keeps reusing
+        the frozen mean, so both the artifact size and the centering drift
+        away from the live corpus over time. Compaction fixes both at the
+        cost of a full re-embed — worth it once the tombstone ratio crosses
+        ``max_tombstone_ratio``.
+        """
+        return self.total_rows > 0 and self.tombstone_ratio > max_tombstone_ratio
+
+    # ------------------------------------------------------------------ #
     # Mutation API
     # ------------------------------------------------------------------ #
     def add_chunks(self, chunks: Iterable[Chunk]) -> None:
