@@ -39,6 +39,28 @@ DEFAULT_BM25_B = 0.75
 
 
 @dataclass
+class SyncStats:
+    """Outcome of :meth:`KBWriter.sync` — the staged delta, before commit.
+
+    ``embedded`` is the count of chunks the following ``commit()`` will run
+    through the embedder (adds + updates); ``unchanged`` chunks are skipped
+    entirely, which is the whole point of content-addressed sync.
+    """
+    added: int = 0
+    updated: int = 0
+    deleted: int = 0
+    unchanged: int = 0
+
+    @property
+    def embedded(self) -> int:
+        return self.added + self.updated
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.added or self.updated or self.deleted)
+
+
+@dataclass
 class _Row:
     """In-memory representation of one chunk_map row + its chunk identity."""
     chunk: Chunk
@@ -160,6 +182,61 @@ class KBWriter:
         for old_id, new_chunk in replacements.items():
             self._pending_deletes.add(old_id)
             self._pending_adds.append(new_chunk)
+
+    def sync(self, chunks: Iterable[Chunk]) -> SyncStats:
+        """Reconcile the live corpus to *exactly* ``chunks`` (content-addressed).
+
+        Diffs the desired chunk set against the current live rows by
+        ``(id, sha256)`` and stages only the delta:
+
+          * id absent from live → **add** (embedded on commit)
+          * id present, sha256 differs → **update** (tombstone + re-embed)
+          * id present, sha256 identical → **unchanged** (skipped — no embed)
+          * live id absent from desired → **delete** (tombstone, no embed)
+
+        Staging only; call :meth:`commit` to apply. The returned
+        :class:`SyncStats` reports the delta and how many chunks the next
+        commit will embed. This is the efficient path for a living corpus:
+        a typical edit re-embeds a handful of chunks instead of all of them.
+        """
+        live: dict[str, str] = {}
+        for row in self._rows:
+            if row.flags & FLAG_TOMBSTONE:
+                continue
+            live[row.chunk.id] = row.chunk.sha256  # later live row wins
+
+        desired: dict[str, Chunk] = {}
+        for c in chunks:
+            if not isinstance(c, Chunk):
+                raise TypeError(f"expected Chunk, got {type(c)}")
+            desired[c.id] = c  # last occurrence wins on duplicate id
+
+        adds: list[Chunk] = []
+        updates: dict[str, Chunk] = {}
+        unchanged = 0
+        for cid, chunk in desired.items():
+            if cid not in live:
+                adds.append(chunk)
+            elif live[cid] != chunk.sha256:
+                updates[cid] = chunk
+            else:
+                unchanged += 1
+
+        deletes = [cid for cid in live if cid not in desired]
+
+        if adds:
+            self.add_chunks(adds)
+        if updates:
+            self.update_chunks(updates)
+        if deletes:
+            self.delete_chunks(deletes)
+
+        return SyncStats(
+            added=len(adds),
+            updated=len(updates),
+            deleted=len(deletes),
+            unchanged=unchanged,
+        )
 
     # ------------------------------------------------------------------ #
     # Commit
