@@ -157,6 +157,27 @@ remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --embedder gemini --gemini-dim 76
 Writes `knowledge.kbi` (hot index) plus a sibling `knowledge.kbc/`
 (chunk shards) in the same directory.
 
+### Incrementally (re)build a v2 index — `sync`
+
+```bash
+remax-kb sync ./my-docs/ -o knowledge.kbi --embedder gemini --gemini-dim 768
+```
+
+For a *living* corpus, `sync` is what you run on every edit instead of a
+fresh `pack`. It opens the existing `.kbi` (or creates one on first run),
+diffs the directory against it content-addressed by `(chunk id, sha256)`,
+and commits only the delta — **re-embedding nothing for unchanged
+chunks**. Adds are embedded, edits are tombstoned-and-re-embedded,
+removed chunks are tombstoned. Embedding cost scales with the change, not
+the corpus.
+
+Output is a JSON summary (`added`/`updated`/`deleted`/`unchanged`/
+`embedded`, plus `live_count`/`total_rows`/`tombstone_ratio`). Tombstones
+and the frozen corpus mean accumulate over many syncs, so `sync`
+auto-compacts (a full re-embed that reclaims dead bytes and refreshes the
+centering) once the tombstone ratio crosses `--compact-threshold`
+(default `0.2`); pass `--no-compact` to disable.
+
 ### Migrate a v1 `.kb` to v2
 
 ```bash
@@ -200,6 +221,14 @@ writer = KBWriter.create(name="knowledge", output_dir="./out", embedder=emb,
                          dim=256, k=8, seed=0)
 writer.add_chunks(walk_directory("./my-docs/"))
 writer.commit()                      # writes out/knowledge.kbi + out/knowledge.kbc/
+
+# Incremental rebuild on a living corpus — embeds only new/changed chunks
+writer = KBWriter.open(name="knowledge", output_dir="./out", embedder=emb)
+stats = writer.sync(walk_directory("./my-docs/"))   # diff by (id, sha256)
+writer.commit()
+print(stats.added, stats.updated, stats.deleted, stats.unchanged, stats.embedded)
+if writer.should_compact():          # tombstones / mean drift past threshold
+    writer.compact()                 # full re-embed of live rows
 
 # Or upgrade an existing v1 file (no re-embedding)
 migrate_v1_to_v2("knowledge.kb", "./out", name="knowledge")

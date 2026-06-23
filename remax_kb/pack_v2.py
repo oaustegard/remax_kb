@@ -39,6 +39,28 @@ DEFAULT_BM25_B = 0.75
 
 
 @dataclass
+class SyncStats:
+    """Outcome of :meth:`KBWriter.sync` — the staged delta, before commit.
+
+    ``embedded`` is the count of chunks the following ``commit()`` will run
+    through the embedder (adds + updates); ``unchanged`` chunks are skipped
+    entirely, which is the whole point of content-addressed sync.
+    """
+    added: int = 0
+    updated: int = 0
+    deleted: int = 0
+    unchanged: int = 0
+
+    @property
+    def embedded(self) -> int:
+        return self.added + self.updated
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.added or self.updated or self.deleted)
+
+
+@dataclass
 class _Row:
     """In-memory representation of one chunk_map row + its chunk identity."""
     chunk: Chunk
@@ -141,6 +163,39 @@ class KBWriter:
         return self._kbc_dir / f"shard-{shard_id:04d}.bin"
 
     # ------------------------------------------------------------------ #
+    # Corpus state / compaction policy
+    # ------------------------------------------------------------------ #
+    @property
+    def total_rows(self) -> int:
+        """Rows on disk including tombstones (committed + applied)."""
+        return len(self._rows)
+
+    @property
+    def live_count(self) -> int:
+        """Non-tombstoned rows."""
+        return sum(1 for r in self._rows if not (r.flags & FLAG_TOMBSTONE))
+
+    @property
+    def tombstone_count(self) -> int:
+        return self.total_rows - self.live_count
+
+    @property
+    def tombstone_ratio(self) -> float:
+        """Fraction of rows that are tombstones; 0.0 for an empty writer."""
+        return self.tombstone_count / self.total_rows if self.total_rows else 0.0
+
+    def should_compact(self, max_tombstone_ratio: float = 0.2) -> bool:
+        """Whether dead weight warrants a compaction.
+
+        Incremental sync never reclaims tombstoned bytes and keeps reusing
+        the frozen mean, so both the artifact size and the centering drift
+        away from the live corpus over time. Compaction fixes both at the
+        cost of a full re-embed — worth it once the tombstone ratio crosses
+        ``max_tombstone_ratio``.
+        """
+        return self.total_rows > 0 and self.tombstone_ratio > max_tombstone_ratio
+
+    # ------------------------------------------------------------------ #
     # Mutation API
     # ------------------------------------------------------------------ #
     def add_chunks(self, chunks: Iterable[Chunk]) -> None:
@@ -160,6 +215,61 @@ class KBWriter:
         for old_id, new_chunk in replacements.items():
             self._pending_deletes.add(old_id)
             self._pending_adds.append(new_chunk)
+
+    def sync(self, chunks: Iterable[Chunk]) -> SyncStats:
+        """Reconcile the live corpus to *exactly* ``chunks`` (content-addressed).
+
+        Diffs the desired chunk set against the current live rows by
+        ``(id, sha256)`` and stages only the delta:
+
+          * id absent from live → **add** (embedded on commit)
+          * id present, sha256 differs → **update** (tombstone + re-embed)
+          * id present, sha256 identical → **unchanged** (skipped — no embed)
+          * live id absent from desired → **delete** (tombstone, no embed)
+
+        Staging only; call :meth:`commit` to apply. The returned
+        :class:`SyncStats` reports the delta and how many chunks the next
+        commit will embed. This is the efficient path for a living corpus:
+        a typical edit re-embeds a handful of chunks instead of all of them.
+        """
+        live: dict[str, str] = {}
+        for row in self._rows:
+            if row.flags & FLAG_TOMBSTONE:
+                continue
+            live[row.chunk.id] = row.chunk.sha256  # later live row wins
+
+        desired: dict[str, Chunk] = {}
+        for c in chunks:
+            if not isinstance(c, Chunk):
+                raise TypeError(f"expected Chunk, got {type(c)}")
+            desired[c.id] = c  # last occurrence wins on duplicate id
+
+        adds: list[Chunk] = []
+        updates: dict[str, Chunk] = {}
+        unchanged = 0
+        for cid, chunk in desired.items():
+            if cid not in live:
+                adds.append(chunk)
+            elif live[cid] != chunk.sha256:
+                updates[cid] = chunk
+            else:
+                unchanged += 1
+
+        deletes = [cid for cid in live if cid not in desired]
+
+        if adds:
+            self.add_chunks(adds)
+        if updates:
+            self.update_chunks(updates)
+        if deletes:
+            self.delete_chunks(deletes)
+
+        return SyncStats(
+            added=len(adds),
+            updated=len(updates),
+            deleted=len(deletes),
+            unchanged=unchanged,
+        )
 
     # ------------------------------------------------------------------ #
     # Commit
