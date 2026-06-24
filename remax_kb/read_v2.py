@@ -117,12 +117,18 @@ class KB:
                     raise ValueError(f"partial bm25/ subdir; missing {missing}")
                 bm25_retriever = _load_bm25_from_zip(zf)
 
-            # int8-quantized rotations (optional). Legacy f32 / no-rotations
-            # readers recompute from (dim,k,seed); int8 must be dequantized
-            # from the shipped sidecar so codes and query land in one space.
+            # Projection planes for the query encoder, in priority order:
+            #   - 'rademacher'  → regenerate ±1 planes from (dim,k,seed); nothing shipped
+            #   - int8          → dequantize the shipped sidecar
+            #   - else (haar)   → None: _dense_search recomputes Haar from the seed
+            # 'deq_rotations', when set, is injected into the quantizer so the
+            # query lands in the same sign-space the corpus was packed against.
             deq_rotations = None
             _bq = manifest.get("binarizer", {})
-            if _bq.get("rotations_quant") == "int8":
+            if _bq.get("projection") == "rademacher":
+                from .projection import rademacher_planes
+                deq_rotations = rademacher_planes(_bq["dim"], _bq["k"], _bq["seed"])
+            elif _bq.get("rotations_quant") == "int8":
                 if {"binarizer/rotations.i8", "binarizer/rotations.scale.f32"} - names:
                     raise ValueError("rotations_quant=int8 but rotations.i8/scale.f32 missing")
                 _dim, _k = _bq["dim"], _bq["k"]

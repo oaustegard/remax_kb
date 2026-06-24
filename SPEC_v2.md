@@ -103,6 +103,8 @@ UTF-8 JSON, no BOM.
     "dim": 256,
     "k": 8,
     "seed": 0,
+    "projection": "haar",
+    "rotations_quant": "float32",
     "mean_vector_b64": "..."
   },
   "lexical": {
@@ -139,6 +141,11 @@ clients to detect updates without re-parsing the body.
 `embedder.*` — identical semantics to v1.
 
 `prompts.*` — identical semantics to v1.
+
+`binarizer.projection` — `"haar"` (default) or `"rademacher"`. Selects the
+hyperplane family and, decisively, whether the rotation is *shipped* or
+*regenerated* — see §projection below. With `"rademacher"` the `.kbi` carries no
+rotation entry and `rotations_quant` is `"none"`.
 
 `binarizer.*` — identical semantics to v1, plus the optional
 `binarizer.rotations_quant` (`"float32"` default, or `"int8"`) which
@@ -259,10 +266,62 @@ detect absence and gracefully degrade to dense-only search.
 
 
 
+## §projection — `haar` vs `rademacher`
+
+`binarizer.projection` chooses the hyperplane family for the stacked-SimHash
+binarizer, and with it the single most consequential portability property: **is
+the projection shipped, or regenerated from the seed?**
+
+### Why it matters
+
+The query is encoded into the same sign-space as the corpus only if producer and
+consumer use the **identical** projection. Two *different* valid projections are
+not approximations of each other — they are statistically independent, so mixing
+them (corpus hashed with A, query with B) flips ~50% of code bits and collapses
+recall to chance. This is not the small, bounded error of int8 quantization
+(~0.24% of bits); it is total.
+
+- **`haar`** (default) — orthogonal matrices from numpy's
+  `PCG64 + Ziggurat + LAPACK-QR`. Not reproducible outside numpy (LAPACK QR even
+  drifts across platforms), so a Haar `.kbi` **MUST ship** the matrices
+  (`rotations.f32`, or int8 `rotations.i8` + scale). Highest recall.
+
+- **`rademacher`** — ±1 hyperplane entries from `splitmix64`, a tiny integer
+  PRNG every language reproduces bit-for-bit. The `.kbi` ships **nothing**; both
+  sides regenerate the planes from `(dim, k, seed)`. ~2 recall@10 points below
+  Haar at matched `k` (bought back with one extra stack), but the rotation
+  sidecar vanishes and the cross-language mismatch failure is structurally
+  impossible. Best for small / portable / skill-bundled KBs.
+
+### Normative `rademacher` algorithm
+
+Entry at flat C-order index `i` in the `(k, dim, dim)` plane tensor
+(`i = (j*dim + row)*dim + col`) is the `i`-th `splitmix64` draw seeded by
+`binarizer.seed`, mapped to a sign. All arithmetic is **unsigned 64-bit
+modular**:
+
+```
+GOLDEN = 0x9E3779B97F4A7C15
+M1     = 0xBF58476D1CE4E5B9
+M2     = 0x94D049BB133111EB
+
+z = (seed + (i+1) * GOLDEN)  mod 2^64
+z = ((z XOR (z >> 30)) * M1) mod 2^64
+z = ((z XOR (z >> 27)) * M2) mod 2^64
+z =  (z XOR (z >> 31))
+entry = -1.0 if (z >> 63) & 1 else +1.0
+```
+
+A reader with `projection == "rademacher"` MUST regenerate planes by this exact
+recipe and MUST NOT expect any `binarizer/rotations.*` entry. Reference
+implementations: `remax_kb.projection.rademacher_planes` (numpy uint64) and
+`rademacherPlanes` in `js/kb-reader.js` (BigInt masked to 64 bits); a
+Python↔Node round-trip pins them bit-identical.
+
 ## `binarizer/rotations.f32`
 
-**Optional.** Pre-computed Haar rotation matrices for the
-stacked-SimHash binarizer.
+**Optional; `haar` projection only.** Pre-computed Haar rotation matrices for
+the stacked-SimHash binarizer.
 
 Layout: `k × dim × dim` float32 little-endian values, concatenated.
 Total size: `k * dim * dim * 4` bytes. Rotation `j` of the k-stack

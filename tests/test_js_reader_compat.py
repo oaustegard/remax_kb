@@ -76,3 +76,28 @@ def test_js_int8_dequant_then_encode_matches_packer(d, k, seed):
         emu = js_encode_python_emulation(x, deq_js, d, k)
         np.testing.assert_array_equal(emu, ref,
             err_msg=f"int8 d={d} k={k} seed={seed} trial={trial}")
+
+
+def js_rademacher_emulation(dim, k, seed):
+    """Mirror of js/kb-reader.js rademacherPlanes() using Python big-ints with
+    explicit 64-bit masking — proves the JS BigInt transcription matches."""
+    MASK = (1 << 64) - 1
+    GOLDEN = 0x9E3779B97F4A7C15
+    M1, M2 = 0xBF58476D1CE4E5B9, 0x94D049BB133111EB
+    n = k * dim * dim
+    out = np.empty(n, dtype=np.float32)
+    s = seed & MASK
+    for i in range(n):
+        z = (s + (i + 1) * GOLDEN) & MASK
+        z = ((z ^ (z >> 30)) * M1) & MASK
+        z = ((z ^ (z >> 27)) * M2) & MASK
+        z = (z ^ (z >> 31)) & MASK
+        out[i] = -1.0 if (z >> 63) & 1 else 1.0
+    return out.reshape(k, dim, dim)
+
+
+@pytest.mark.parametrize("dim,k,seed", [(8, 2, 0), (16, 3, 7), (64, 2, 42)])
+def test_js_rademacher_matches_python(dim, k, seed):
+    from remax_kb.projection import rademacher_planes
+    np.testing.assert_array_equal(
+        js_rademacher_emulation(dim, k, seed), rademacher_planes(dim, k, seed))
