@@ -100,18 +100,24 @@ class KBWriter:
         chunks_uri: str | None = None,
         source: str = "",
         rotations_quant: str = "float32",
+        projection: str = "haar",
     ):
         if dim % 8 != 0:
             raise ValueError(f"dim must be a multiple of 8, got {dim}")
         if rotations_quant not in ("float32", "int8"):
             raise ValueError(f"rotations_quant must be 'float32' or 'int8', got {rotations_quant!r}")
+        if projection not in ("haar", "rademacher"):
+            raise ValueError(f"projection must be 'haar' or 'rademacher', got {projection!r}")
         self._name = name
         self._output_dir = Path(output_dir)
         self._embedder = embedder
         self._dim = dim
         self._k = k
         self._seed = seed
-        self._rotations_quant = rotations_quant
+        # 'rademacher' regenerates ±1 planes from (dim,k,seed) on both sides and
+        # ships no rotation sidecar; rotations_quant is moot there.
+        self._projection = projection
+        self._rotations_quant = rotations_quant if projection == "haar" else "none"
         self._quantizer_obj = None       # cached StackedSignBitQuantizer
         self._rotations_i8 = None        # (codes_i8, scale_f32) when int8
         self._shard_max = shard_max_bytes
@@ -490,7 +496,11 @@ class KBWriter:
         if self._quantizer_obj is None:
             from remax import StackedSignBitQuantizer
             q = StackedSignBitQuantizer(d=self._dim, k=self._k, seed=self._seed)
-            if self._rotations_quant == "int8":
+            if self._projection == "rademacher":
+                # Seed-only ±1 planes: identical on both sides, nothing shipped.
+                from .projection import rademacher_planes
+                q.rotations_ = rademacher_planes(self._dim, self._k, self._seed).astype(q.dtype)
+            elif self._rotations_quant == "int8":
                 from .rotations import quantize_int8, dequantize_int8
                 codes_i8, scale_f32 = quantize_int8(q.rotations_.astype(np.float32))
                 q.rotations_ = dequantize_int8(codes_i8, scale_f32).astype(q.dtype)
@@ -526,10 +536,13 @@ class KBWriter:
             zf.writestr("vectors.bin", vectors_bytes)
             zf.writestr("chunk_map.bin", chunk_map_bytes)
             zf.writestr("chunk_ids.bin", chunk_ids_bytes)
-            # Pre-computed Haar rotations — see SPEC_v2 §binarizer/rotations.
-            # f32 by default; int8 + per-column scale when rotations_quant set.
+            # Projection sidecar — see SPEC_v2 §binarizer/rotations. The
+            # 'rademacher' projection ships NOTHING (planes regenerate from
+            # (dim,k,seed)); 'haar' ships f32, or int8 + per-column scale.
             q = self._get_quantizer()
-            if self._rotations_quant == "int8":
+            if self._projection == "rademacher":
+                pass  # no rotation entry; reader rebuilds ±1 planes from the seed
+            elif self._rotations_quant == "int8":
                 codes_i8, scale_f32 = self._rotations_i8
                 zf.writestr("binarizer/rotations.i8",
                             np.ascontiguousarray(codes_i8, dtype=np.int8).tobytes())
@@ -604,6 +617,7 @@ class KBWriter:
                 "dim": self._dim,
                 "k": self._k,
                 "seed": self._seed,
+                "projection": self._projection,
                 "rotations_quant": self._rotations_quant,
                 "mean_vector_b64": _np_to_b64(self._mean_vector),
             },
@@ -652,7 +666,8 @@ class KBWriter:
         self._dim = manifest["binarizer"]["dim"]
         self._k = manifest["binarizer"]["k"]
         self._seed = manifest["binarizer"]["seed"]
-        # Preserve rotation quantization across mutation re-commits.
+        # Preserve projection + quantization across mutation re-commits.
+        self._projection = manifest["binarizer"].get("projection", "haar")
         self._rotations_quant = manifest["binarizer"].get("rotations_quant", "float32")
         self._mean_vector = _b64_to_np(manifest["binarizer"]["mean_vector_b64"])
         self._version = manifest["version"]
