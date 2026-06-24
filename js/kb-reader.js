@@ -191,6 +191,34 @@ function hammingDistance(a, b, len) {
  *
  * @returns {Uint8Array} of length `(dim * k) / 8`
  */
+/**
+ * Regenerate the Rademacher (±1) projection planes from (dim, k, seed).
+ *
+ * Bit-identical to `remax_kb.projection.rademacher_planes` — both compute a
+ * splitmix64 stream over the flat (k, dim, dim) tensor (C-order) and map the
+ * top bit of each draw to ±1. All arithmetic is unsigned 64-bit modular,
+ * done here with BigInt masked to 64 bits. See SPEC_v2 §projection.
+ *
+ * @returns {Float32Array} of length k*dim*dim, entries ∈ {-1, +1}
+ */
+export function rademacherPlanes(dim, k, seed) {
+  const MASK = (1n << 64n) - 1n;
+  const GOLDEN = 0x9e3779b97f4a7c15n;
+  const M1 = 0xbf58476d1ce4e5b9n;
+  const M2 = 0x94d049bb133111ebn;
+  const n = k * dim * dim;
+  const out = new Float32Array(n);
+  const s = BigInt(seed) & MASK;
+  for (let i = 0; i < n; i++) {
+    let z = (s + BigInt(i + 1) * GOLDEN) & MASK;
+    z = ((z ^ (z >> 30n)) * M1) & MASK;
+    z = ((z ^ (z >> 27n)) * M2) & MASK;
+    z = (z ^ (z >> 31n)) & MASK;
+    out[i] = (z >> 63n) & 1n ? -1 : 1;
+  }
+  return out;
+}
+
 export function encodeQueryCode(qVec, mean, rotations, dim, k) {
   const fullDim = mean.length;
   if (qVec.length !== fullDim) {
@@ -340,13 +368,15 @@ export class KBReader {
       );
     }
 
-    // Rotations — f32 sidecar, or int8 + per-output-column scale.
-    // See SPEC_v2 §binarizer/rotations.i8. The corpus is packed against the
-    // dequantized rotations, so we dequantize and use these exactly (never
-    // re-derive from seed).
+    // Projection planes for the query encoder. 'rademacher' ships nothing and
+    // is regenerated from (dim,k,seed); 'haar' ships an f32 or int8 sidecar.
+    // See SPEC_v2 §binarizer/rotations + §projection.
     const nRot = this._k * this._dim * this._dim;
+    const projection = bin.projection || "haar";
     const rotQuant = bin.rotations_quant || "float32";
-    if (rotQuant === "int8") {
+    if (projection === "rademacher") {
+      this._rotations = rademacherPlanes(this._dim, this._k, bin.seed);
+    } else if (rotQuant === "int8") {
       if (!zip.has("binarizer/rotations.i8") ||
           !zip.has("binarizer/rotations.scale.f32")) {
         throw new Error(
