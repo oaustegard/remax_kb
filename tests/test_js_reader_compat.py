@@ -101,3 +101,43 @@ def test_js_rademacher_matches_python(dim, k, seed):
     from remax_kb.projection import rademacher_planes
     np.testing.assert_array_equal(
         js_rademacher_emulation(dim, k, seed), rademacher_planes(dim, k, seed))
+
+
+def js_srht_emulation(dim, k, seed, rounds):
+    """Mirror of js/kb-reader.js srhtMatrix() — integer FWHT + float32 column norm."""
+    import numpy as np
+    MASK=(1<<64)-1; GOLDEN=0x9E3779B97F4A7C15; M1=0xBF58476D1CE4E5B9; M2=0x94D049BB133111EB
+    pad=1
+    while pad<dim: pad<<=1
+    nsign=k*rounds*pad; sign=np.empty(nsign,dtype=np.int64); s=seed&MASK
+    for i in range(nsign):
+        z=(s+(i+1)*GOLDEN)&MASK; z=((z^(z>>30))*M1)&MASK; z=((z^(z>>27))*M2)&MASK; z=(z^(z>>31))&MASK
+        sign[i]=-1 if (z>>63)&1 else 1
+    def fwht(a):
+        h=1
+        while h<pad:
+            for i in range(0,pad,h*2):
+                for j in range(i,i+h):
+                    x=a[j]; y=a[j+h]; a[j]=x+y; a[j+h]=x-y
+            h*=2
+    out=np.empty(k*dim*dim,dtype=np.float32)
+    for jj in range(k):
+        R=np.zeros((dim,dim),dtype=np.float64)
+        for d in range(dim):
+            row=np.zeros(pad,dtype=np.float64); row[d]=1.0
+            for r in range(rounds):
+                off=(jj*rounds+r)*pad
+                for p in range(pad): row[p]*=sign[off+p]
+                fwht(row)
+            R[d]=row[:dim]
+        for e in range(dim):
+            nrm=np.sqrt((R[:,e]**2).sum()) or 1.0
+            for d in range(dim): out[jj*dim*dim+d*dim+e]=np.float32(R[d,e]/nrm)
+    return out.reshape(k,dim,dim)
+
+
+@pytest.mark.parametrize("dim,k,seed,rounds", [(8,2,0,2),(16,2,7,3),(64,2,42,3)])
+def test_js_srht_matches_python(dim,k,seed,rounds):
+    from remax_kb.projection import srht_matrix
+    np.testing.assert_array_equal(js_srht_emulation(dim,k,seed,rounds),
+                                  srht_matrix(dim,k,seed,rounds))
