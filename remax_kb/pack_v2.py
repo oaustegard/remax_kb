@@ -101,22 +101,24 @@ class KBWriter:
         source: str = "",
         rotations_quant: str = "float32",
         projection: str = "haar",
+        srht_rounds: int = 3,
     ):
         if dim % 8 != 0:
             raise ValueError(f"dim must be a multiple of 8, got {dim}")
         if rotations_quant not in ("float32", "int8"):
             raise ValueError(f"rotations_quant must be 'float32' or 'int8', got {rotations_quant!r}")
-        if projection not in ("haar", "rademacher"):
-            raise ValueError(f"projection must be 'haar' or 'rademacher', got {projection!r}")
+        if projection not in ("haar", "rademacher", "srht"):
+            raise ValueError(f"projection must be 'haar', 'rademacher', or 'srht', got {projection!r}")
         self._name = name
         self._output_dir = Path(output_dir)
         self._embedder = embedder
         self._dim = dim
         self._k = k
         self._seed = seed
-        # 'rademacher' regenerates ±1 planes from (dim,k,seed) on both sides and
-        # ships no rotation sidecar; rotations_quant is moot there.
+        # 'rademacher'/'srht' regenerate planes from (dim,k,seed[,rounds]) on both
+        # sides and ship no rotation sidecar; rotations_quant is moot there.
         self._projection = projection
+        self._srht_rounds = srht_rounds
         self._rotations_quant = rotations_quant if projection == "haar" else "none"
         self._quantizer_obj = None       # cached StackedSignBitQuantizer
         self._rotations_i8 = None        # (codes_i8, scale_f32) when int8
@@ -500,6 +502,11 @@ class KBWriter:
                 # Seed-only ±1 planes: identical on both sides, nothing shipped.
                 from .projection import rademacher_planes
                 q.rotations_ = rademacher_planes(self._dim, self._k, self._seed).astype(q.dtype)
+            elif self._projection == "srht":
+                # Seed-only structured-orthogonal projection; nothing shipped.
+                from .projection import srht_matrix
+                q.rotations_ = srht_matrix(self._dim, self._k, self._seed,
+                                           self._srht_rounds).astype(q.dtype)
             elif self._rotations_quant == "int8":
                 from .rotations import quantize_int8, dequantize_int8
                 codes_i8, scale_f32 = quantize_int8(q.rotations_.astype(np.float32))
@@ -540,8 +547,8 @@ class KBWriter:
             # 'rademacher' projection ships NOTHING (planes regenerate from
             # (dim,k,seed)); 'haar' ships f32, or int8 + per-column scale.
             q = self._get_quantizer()
-            if self._projection == "rademacher":
-                pass  # no rotation entry; reader rebuilds ±1 planes from the seed
+            if self._projection in ("rademacher", "srht"):
+                pass  # no rotation entry; reader rebuilds planes from the seed
             elif self._rotations_quant == "int8":
                 codes_i8, scale_f32 = self._rotations_i8
                 zf.writestr("binarizer/rotations.i8",
@@ -618,6 +625,7 @@ class KBWriter:
                 "k": self._k,
                 "seed": self._seed,
                 "projection": self._projection,
+                **({"srht_rounds": self._srht_rounds} if self._projection == "srht" else {}),
                 "rotations_quant": self._rotations_quant,
                 "mean_vector_b64": _np_to_b64(self._mean_vector),
             },
@@ -668,6 +676,7 @@ class KBWriter:
         self._seed = manifest["binarizer"]["seed"]
         # Preserve projection + quantization across mutation re-commits.
         self._projection = manifest["binarizer"].get("projection", "haar")
+        self._srht_rounds = manifest["binarizer"].get("srht_rounds", 3)
         self._rotations_quant = manifest["binarizer"].get("rotations_quant", "float32")
         self._mean_vector = _b64_to_np(manifest["binarizer"]["mean_vector_b64"])
         self._version = manifest["version"]

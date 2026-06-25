@@ -219,6 +219,71 @@ export function rademacherPlanes(dim, k, seed) {
   return out;
 }
 
+/**
+ * Regenerate the SRHT projection matrix from (dim, k, seed, rounds).
+ *
+ * Bit-identical to `remax_kb.projection.srht_matrix`. Each stack is `rounds`
+ * rounds of (seed-driven ±1 diagonal, then Walsh–Hadamard) applied to the
+ * `dim→pad` zero-padded identity, taken back to `dim`, then per-output-column
+ * L2-normalized to float32. The FWHT is pure integer (magnitudes stay < 2^53,
+ * exact in JS numbers); the normalize uses `Math.fround` to match numpy float32.
+ * See SPEC_v2 §projection.
+ *
+ * @returns {Float32Array} of length k*dim*dim, row-major (stack, d, e)
+ */
+export function srhtMatrix(dim, k, seed, rounds) {
+  const MASK = (1n << 64n) - 1n;
+  const GOLDEN = 0x9e3779b97f4a7c15n;
+  const M1 = 0xbf58476d1ce4e5b9n;
+  const M2 = 0x94d049bb133111ebn;
+  let pad = 1;
+  while (pad < dim) pad <<= 1;
+  // splitmix64 ±1 signs, flat index ((j*rounds + r)*pad + p)
+  const nSign = k * rounds * pad;
+  const sign = new Int32Array(nSign);
+  const s = BigInt(seed) & MASK;
+  for (let i = 0; i < nSign; i++) {
+    let z = (s + BigInt(i + 1) * GOLDEN) & MASK;
+    z = ((z ^ (z >> 30n)) * M1) & MASK;
+    z = ((z ^ (z >> 27n)) * M2) & MASK;
+    z = (z ^ (z >> 31n)) & MASK;
+    sign[i] = (z >> 63n) & 1n ? -1 : 1;
+  }
+  const fwht = (a) => {
+    for (let h = 1; h < pad; h <<= 1) {
+      for (let i = 0; i < pad; i += h * 2) {
+        for (let j = i; j < i + h; j++) {
+          const x = a[j], y = a[j + h];
+          a[j] = x + y; a[j + h] = x - y;
+        }
+      }
+    }
+  };
+  const out = new Float32Array(k * dim * dim);
+  for (let j = 0; j < k; j++) {
+    const R = new Float64Array(dim * dim);  // R[d*dim + e]
+    for (let d = 0; d < dim; d++) {
+      const row = new Float64Array(pad);
+      row[d] = 1;
+      for (let r = 0; r < rounds; r++) {
+        const off = (j * rounds + r) * pad;
+        for (let p = 0; p < pad; p++) row[p] *= sign[off + p];
+        fwht(row);
+      }
+      for (let e = 0; e < dim; e++) R[d * dim + e] = row[e];
+    }
+    for (let e = 0; e < dim; e++) {
+      let ss = 0;
+      for (let d = 0; d < dim; d++) { const v = R[d * dim + e]; ss += v * v; }
+      const nrm = Math.sqrt(ss) || 1;
+      for (let d = 0; d < dim; d++) {
+        out[j * dim * dim + d * dim + e] = Math.fround(R[d * dim + e] / nrm);
+      }
+    }
+  }
+  return out;
+}
+
 export function encodeQueryCode(qVec, mean, rotations, dim, k) {
   const fullDim = mean.length;
   if (qVec.length !== fullDim) {
@@ -376,6 +441,8 @@ export class KBReader {
     const rotQuant = bin.rotations_quant || "float32";
     if (projection === "rademacher") {
       this._rotations = rademacherPlanes(this._dim, this._k, bin.seed);
+    } else if (projection === "srht") {
+      this._rotations = srhtMatrix(this._dim, this._k, bin.seed, bin.srht_rounds ?? 3);
     } else if (rotQuant === "int8") {
       if (!zip.has("binarizer/rotations.i8") ||
           !zip.has("binarizer/rotations.scale.f32")) {

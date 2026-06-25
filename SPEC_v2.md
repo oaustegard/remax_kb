@@ -318,6 +318,37 @@ implementations: `remax_kb.projection.rademacher_planes` (numpy uint64) and
 `rademacherPlanes` in `js/kb-reader.js` (BigInt masked to 64 bits); a
 Python↔Node round-trip pins them bit-identical.
 
+### `projection == "srht"` — structured-orthogonal, seed-only
+
+The preferred seed-only projection: ~Haar recall (recovers ~85% of the
+Rademacher→Haar gap) at no shipped bytes. `binarizer.srht_rounds` (default 3)
+sets the mixing depth. Like `rademacher` it ships **no** `binarizer/rotations.*`
+entry — the matrix is regenerated from `(dim, k, seed, srht_rounds)`.
+
+Each stack is an exactly-orthogonal structured transform: `srht_rounds` rounds of
+(seed-driven ±1 diagonal `D`, then a Walsh–Hadamard transform `H`) on the
+`dim`-vector zero-padded to `pad = next-power-of-two ≥ dim`. It is **materialized
+as a matrix** so readers reuse the same `x @ M` + sign-pack path as Haar:
+
+```
+pad = next power of two ≥ dim
+sign[stack j, round r, pos p] = top-bit→±1 of the splitmix64 draw (same stream as
+    `rademacher`) at flat index  ((j*srht_rounds + r) * pad + p)
+# row d of stack j = the padded basis vector e_d pushed through the rounds:
+row = e_d            (length pad, integer)
+for r in 0 .. srht_rounds-1:
+    row = FWHT( row * sign[j, r] )          # integer Walsh–Hadamard, exact
+M_int[j, d, e] = row[e]                       for e in 0..dim-1
+# per-output-column L2 normalize into float32 (sign-invariant, keeps the matmul
+# well-conditioned and the entries inside float32):
+M[j, :, e] = float32( M_int[j, :, e] / ||M_int[j, :, e]||_2 )
+```
+
+FWHT magnitudes stay small (≈ a few thousand at rounds=3), exact in int64 and in
+JS numbers (< 2^53). Reference implementations: `remax_kb.projection.srht_matrix`
+and `srhtMatrix` in `js/kb-reader.js` (`Math.fround` to match numpy float32); a
+Python↔Node round-trip pins the matrix and the resulting codes bit-identical.
+
 ## `binarizer/rotations.f32`
 
 **Optional; `haar` projection only.** Pre-computed Haar rotation matrices for
