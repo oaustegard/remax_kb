@@ -128,6 +128,10 @@ class KB:
             if _bq.get("projection") == "rademacher":
                 from .projection import rademacher_planes
                 deq_rotations = rademacher_planes(_bq["dim"], _bq["k"], _bq["seed"])
+            elif _bq.get("projection") == "srht":
+                from .projection import srht_matrix
+                deq_rotations = srht_matrix(_bq["dim"], _bq["k"], _bq["seed"],
+                                            _bq.get("srht_rounds", 3))
             elif _bq.get("rotations_quant") == "int8":
                 if {"binarizer/rotations.i8", "binarizer/rotations.scale.f32"} - names:
                     raise ValueError("rotations_quant=int8 but rotations.i8/scale.f32 missing")
