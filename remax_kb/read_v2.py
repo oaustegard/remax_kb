@@ -19,6 +19,8 @@ from urllib.parse import urljoin, urlparse
 import bm25s
 import numpy as np
 
+from ._hamming import _popcount_rows
+
 
 SPEC_VERSION = "2"
 KIND = "split-index"
@@ -282,7 +284,7 @@ class KB:
         # Hamming scan, skipping tombstones
         # XOR rows, sum popcount per row
         xor = np.bitwise_xor(self._vectors, q_code[None, :])
-        # popcount via lookup table
+        # popcount per row via hardware POPCNT (see _hamming._popcount_rows)
         dists = _popcount_rows(xor)
         # Mask tombstones to a large value so they don't appear
         tomb_mask = self._tombstone_mask()
@@ -385,14 +387,6 @@ class KB:
 # ─────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────
-
-_POPCOUNT_LUT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint16)
-
-
-def _popcount_rows(xor: np.ndarray) -> np.ndarray:
-    """Sum popcount per row of an (N, B) uint8 array."""
-    return _POPCOUNT_LUT[xor].sum(axis=1).astype(np.int32)
-
 
 def _load_bm25_from_zip(zf: zipfile.ZipFile) -> bm25s.BM25:
     """Load bm25s.BM25 from a zip subdir by extracting to a tempdir."""
