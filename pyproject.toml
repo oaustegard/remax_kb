@@ -38,7 +38,13 @@ handlers = [
 api = [
     "httpx>=0.25",
 ]
-dev = ["pytest>=7.0", "beautifulsoup4>=4.11", "pypdf>=4.0", "httpx>=0.25"]
+# Optional multi-bit remex codec (rotation + Lloyd-Max scalar quant).
+# numpy+scipy only — scipy is already a core dep, so this is light.
+remex = [
+    "remex @ git+https://github.com/oaustegard/remex.git",
+]
+dev = ["pytest>=7.0", "beautifulsoup4>=4.11", "pypdf>=4.0", "httpx>=0.25",
+       "remex @ git+https://github.com/oaustegard/remex.git"]
 
 [project.scripts]
 remax-kb = "remax_kb.cli:main"
