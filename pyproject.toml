@@ -13,6 +13,7 @@ authors = [{name = "Oskar Austegard"}]
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
+    "bm25s>=0.2",          # read_v2 imports it at module load (v2 BM25 fusion)
     "remax @ git+https://github.com/oaustegard/remax.git",
 ]
 
