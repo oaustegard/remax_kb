@@ -2,6 +2,8 @@
 # Heavyweight (torch + transformers + adapters) — only needed offline.
 numpy>=1.24
 remax @ git+https://github.com/oaustegard/remax.git
+# remex codec (optional --codec remex). numpy+scipy only.
+remex @ git+https://github.com/oaustegard/remex.git
 torch
 transformers
 sentence-transformers

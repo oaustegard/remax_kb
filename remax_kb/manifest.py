@@ -14,6 +14,11 @@ import numpy as np
 
 SPEC_VERSION = "1"
 BINARIZER_KIND = "remax-centered-simhash"
+# Second, opt-in codec: remex rotation + Lloyd-Max scalar quantization
+# (multi-bit). Higher fidelity to fp32 than 1-bit SimHash on general
+# (isotropic) embedders like Jina. See SPEC.md "remex codec".
+REMEX_KIND = "remex-lloyd-max"
+SUPPORTED_BINARIZER_KINDS = (BINARIZER_KIND, REMEX_KIND)
 
 
 @dataclass
@@ -46,6 +51,10 @@ class Binarizer:
     k: int
     seed: int
     mean_vector_b64: str
+    # Bits per coordinate. 1 for the remax 1-bit SimHash codec (the sign
+    # bit); 1..8 for the remex Lloyd-Max codec. Defaults to 1 so manifests
+    # written before this field deserialize unchanged.
+    bits: int = 1
 
     @property
     def mean_vector(self) -> np.ndarray:
@@ -70,6 +79,31 @@ class Binarizer:
             k=int(k),
             seed=int(seed),
             mean_vector_b64=base64.b64encode(arr.tobytes()).decode("ascii"),
+        )
+
+    @classmethod
+    def from_remex(
+        cls,
+        *,
+        remax_version: str,
+        dim: int,
+        bits: int,
+        seed: int,
+        full_dim: int,
+    ) -> "Binarizer":
+        """remex codec descriptor. remex does NOT center (it normalizes +
+        rotates per-vector; centering measurably hurts it), so the stored
+        mean is zeros and the reader's subtract is a no-op. k is fixed to 1
+        and unused. The rotation is seed-derived, so nothing extra ships."""
+        zeros = np.zeros(int(full_dim), dtype="<f4")
+        return cls(
+            kind=REMEX_KIND,
+            remax_version=remax_version,
+            dim=int(dim),
+            k=1,
+            seed=int(seed),
+            mean_vector_b64=base64.b64encode(zeros.tobytes()).decode("ascii"),
+            bits=int(bits),
         )
 
 
@@ -116,7 +150,10 @@ class Manifest:
         return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
 
     def bytes_per_row(self) -> int:
-        return (self.binarizer.dim * self.binarizer.k) // 8
+        b = self.binarizer
+        if b.kind == REMEX_KIND:
+            return (b.dim * b.bits) // 8
+        return (b.dim * b.k) // 8
 
     def validate_static(self) -> None:
         """Static checks not requiring an embedder or the vectors blob."""
@@ -125,10 +162,10 @@ class Manifest:
                 f"unsupported spec_version {self.spec_version!r}; "
                 f"this reader speaks {SPEC_VERSION!r}"
             )
-        if self.binarizer.kind != BINARIZER_KIND:
+        if self.binarizer.kind not in SUPPORTED_BINARIZER_KINDS:
             raise ValueError(
                 f"unsupported binarizer kind {self.binarizer.kind!r}; "
-                f"this reader speaks {BINARIZER_KIND!r}"
+                f"this reader speaks {SUPPORTED_BINARIZER_KINDS!r}"
             )
         if self.binarizer.dim <= 0 or self.binarizer.dim % 8 != 0:
             raise ValueError(
@@ -139,6 +176,16 @@ class Manifest:
             raise ValueError(
                 f"binarizer.k must be positive, got {self.binarizer.k}"
             )
+        if self.binarizer.kind == REMEX_KIND:
+            if not (1 <= self.binarizer.bits <= 8):
+                raise ValueError(
+                    f"remex binarizer.bits must be in 1..8, got {self.binarizer.bits}"
+                )
+            if (self.binarizer.dim * self.binarizer.bits) % 8 != 0:
+                raise ValueError(
+                    f"remex dim*bits must be a multiple of 8, got "
+                    f"{self.binarizer.dim}*{self.binarizer.bits}"
+                )
         if self.embedder.full_dim <= 0:
             raise ValueError(
                 f"embedder.full_dim must be positive, got {self.embedder.full_dim}"

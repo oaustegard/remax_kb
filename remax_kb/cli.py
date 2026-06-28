@@ -57,6 +57,9 @@ def _build_embedder(name: str, args: argparse.Namespace):
 # --------------------------------------------------------------------------- #
 def _cmd_pack(args: argparse.Namespace) -> int:
     if args.v2:
+        if getattr(args, "codec", "remax") != "remax":
+            print("--codec remex is only supported for v1 .kb (not --v2)", file=sys.stderr)
+            return 2
         return _cmd_pack_v2(args)
 
     from . import pack_directory
@@ -70,6 +73,8 @@ def _cmd_pack(args: argparse.Namespace) -> int:
         dim=args.dim,
         k=args.k,
         seed=args.seed,
+        codec=args.codec,
+        bits=args.bits,
         source_description=args.source,
         batch_size=args.batch_size,
     )
@@ -257,7 +262,9 @@ def _cmd_info(args: argparse.Namespace) -> int:
             "kind": m.binarizer.kind,
             "dim": m.binarizer.dim,
             "k": m.binarizer.k,
+            "bits": m.binarizer.bits,
             "seed": m.binarizer.seed,
+            "bytes_per_row": m.bytes_per_row(),
         },
     }
     print(json.dumps(payload, indent=2))
@@ -366,8 +373,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pack_p.add_argument("--v2", action="store_true", help="emit a split .kbi + .kbc/ (spec v2)")
     pack_p.add_argument("--pattern", default="**/*", help='glob (default: "**/*")')
     pack_p.add_argument("--dim", type=int, default=256, help="binarizer dim (default 256)")
-    pack_p.add_argument("--k", type=int, default=8, help="stacked-SimHash stack count (default 8)")
+    pack_p.add_argument("--k", type=int, default=8, help="stacked-SimHash stack count (default 8; remax codec only)")
     pack_p.add_argument("--seed", type=int, default=0, help="RNG seed (default 0)")
+    pack_p.add_argument("--codec", choices=("remax", "remex"), default="remax",
+                        help="vector codec: remax 1-bit SimHash (default) or remex multi-bit Lloyd-Max (v1 .kb only)")
+    pack_p.add_argument("--bits", type=int, default=4,
+                        help="bits/coord for --codec remex (1..8, default 4)")
     pack_p.add_argument("--source", default="", help="free-text source description")
     pack_p.add_argument("--batch-size", type=int, default=16, help="(v1 only) embed batch size")
     _embedder_args(pack_p)

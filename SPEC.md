@@ -104,8 +104,13 @@ nano). The `mean_vector_b64` is at this dimension.
 `prompts.query` / `prompts.document` — exact prefix strings prepended at
 embed time. The reader MUST reproduce these byte-for-byte.
 
-`binarizer.kind` — string identifier. For v1 the only recognized value
-is `"remax-centered-simhash"`. A reader MUST refuse unknown kinds.
+`binarizer.kind` — string identifier selecting the vector codec. v1
+recognizes two values; a reader MUST refuse unknown kinds:
+- `"remax-centered-simhash"` — the default 1-bit centered-SimHash codec
+  (Hamming scan). `dim * k` bits per chunk.
+- `"remex-lloyd-max"` — the optional multi-bit remex codec (rotation +
+  Lloyd-Max scalar quantization). `dim * bits` bits per chunk. See
+  "remex codec" below.
 
 `binarizer.remax_version` — version of the `remax` package used to
 encode. Informational; the binary scheme is fully determined by
@@ -116,7 +121,13 @@ Matryoshka-truncated to this width after centering. Must be a divisor of
 8.
 
 `binarizer.k` — stack count for `remax.StackedSignBitQuantizer`. Total
-bits per chunk = `dim * k`.
+bits per chunk = `dim * k`. For the remex codec `k` is fixed to `1` and
+unused.
+
+`binarizer.bits` — bits per coordinate. `1` for the remax codec (the sign
+bit). `1..8` for the remex codec, where total bits per chunk = `dim *
+bits`. Defaults to `1` when absent, so manifests written before this field
+deserialize unchanged. `dim * bits` MUST be a multiple of 8.
 
 `binarizer.seed` — master RNG seed for the stacked Haar rotations. With
 the same `(dim, k, seed)`, encoding is bit-identical across machines.
@@ -150,6 +161,40 @@ Row `i` contains the stacked-SimHash code for chunk `i`. Within a row,
 the `k` per-rotation signatures sit contiguously, in seed-derived order
 (see `remax.StackedSignBitQuantizer` for the layout).
 
+For the remex codec, `vectors.bin` is the bit-packed `uint8` index array
+(`remex.pack(indices, bits)`): `N * dim` indices, each `bits` wide, packed
+LSB-first and contiguous, total `N * (dim * bits // 8)` bytes. The reader
+recovers indices with `remex.unpack(blob, bits, N * dim).reshape(N, dim)`,
+wraps them in a `remex.CompressedVectors` (norms reconstructed as `1.0` —
+the codec requires an L2-normalizing embedder, so per-row norms are not
+stored), and scores by inner product against the decoded corpus.
+
+## remex codec
+
+`"remex-lloyd-max"` stores multi-bit Lloyd-Max scalar-quantized codes
+instead of 1-bit SimHash. It is the higher-fidelity / mid-byte operating
+point: on general (isotropic) embedders such as Jina v5-nano, remex 4-bit
+@ d=768 reproduces the fp32 ranking near-losslessly, well above any 1-bit
+SimHash config at equal bytes. (On specialized, tightly-clustered encoders
+like SPECTER2 the ordering can invert — 1-bit wins — so the codec is a
+per-embedder choice, not a universal upgrade.)
+
+Differences from the remax codec, all reader-visible via the manifest:
+
+- **No centering.** remex normalizes and rotates each vector; subtracting a
+  corpus mean measurably hurts it. `mean_vector_b64` is therefore all zeros
+  and the reader's subtract is a no-op. The query is truncated to `dim`
+  directly, with no centering.
+- **`bits` carries the width** (`dim * bits` bits/chunk); `k = 1`.
+- **Scoring is inner-product**, not Hamming. `search()` returns an integer
+  angular distance `round((1 - cosine) * 10000)` (≈0 for a near-identical
+  match), ascending, so the result contract (best-first) matches the remax
+  path.
+- **Determinism** is by `(dim, bits, seed)` — the Haar rotation and
+  Lloyd-Max boundaries are derived from these alone; nothing extra ships.
+- **Dependency:** the reader imports `remex` only for this kind (lazy), so
+  remax-codec readers are unaffected.
+
 ## `chunks.jsonl`
 
 UTF-8 JSON lines, exactly `N` lines, one chunk per line, **sorted by row
@@ -180,9 +225,11 @@ A conforming reader, on opening a `.kb`, MUST in this order:
 1. Open the zip and confirm exactly `manifest.json`, `vectors.bin`,
    `chunks.jsonl` are present.
 2. Parse `manifest.json` and refuse if `spec_version != "1"` or
-   `binarizer.kind != "remax-centered-simhash"`.
+   `binarizer.kind` is not one of `"remax-centered-simhash"` /
+   `"remex-lloyd-max"`.
 3. Verify `corpus.chunk_count == N == len(chunks.jsonl)` where
-   `N = len(vectors.bin) // (dim * k // 8)`.
+   `N = len(vectors.bin) // bytes_per_row`, and `bytes_per_row` is
+   `dim * k // 8` (remax) or `dim * bits // 8` (remex).
 4. Verify `corpus.build_hash == sha256(vectors.bin || chunks.jsonl)`.
 
 A conforming reader, when invoked with an embedder, MUST additionally

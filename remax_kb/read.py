@@ -11,7 +11,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from ._hamming import hamming_scan, top_k
-from .manifest import Manifest
+from .manifest import Manifest, REMEX_KIND
 
 
 class Embedder(Protocol):
@@ -45,6 +45,7 @@ class KB:
         self._codes = loaded.codes
         self._chunks = loaded.chunks
         self.path = path
+        self._remex_docmat: np.ndarray | None = None  # lazily decoded (remex only)
 
     # ------------------------------------------------------------------ #
     # Construction / validation
@@ -149,7 +150,12 @@ class KB:
         embedder: Embedder,
         k: int = 5,
     ) -> list[tuple[int, dict[str, Any]]]:
-        """Return [(hamming_distance, chunk_dict), ...] sorted ascending."""
+        """Return ``[(distance, chunk_dict), ...]`` sorted best-first (ascending
+        distance). For the remax codec ``distance`` is the integer Hamming
+        distance; for the remex codec it is an integer angular distance,
+        ``round((1 - cosine) * 10000)`` (≈0 for a near-identical match)."""
+        if self._m.binarizer.kind == REMEX_KIND:
+            return self._search_remex(query, embedder=embedder, k=k)
         q_code = self.encode_query(query, embedder=embedder)
         dists = hamming_scan(self._codes, q_code)
         idx = top_k(dists, k=k)
@@ -169,3 +175,48 @@ class KB:
             seed=self._m.binarizer.seed,
         )
         return q.encode(X)
+
+    # ------------------------------------------------------------------ #
+    # remex codec
+    # ------------------------------------------------------------------ #
+    def _remex_quantizer(self):
+        from remex import Quantizer
+
+        b = self._m.binarizer
+        return Quantizer(d=b.dim, bits=b.bits, seed=b.seed)
+
+    def _remex_doc_matrix(self) -> np.ndarray:
+        """Decode the packed remex codes to approximate ``(N, dim)`` float
+        vectors once, then cache. remex vectors are unit-norm (the codec
+        requires an L2-normalizing embedder), so per-row norms are not stored
+        and are reconstructed as 1.0."""
+        if self._remex_docmat is None:
+            from remex import unpack, CompressedVectors
+
+            b = self._m.binarizer
+            n = len(self._chunks)
+            flat = np.ascontiguousarray(self._codes).ravel()
+            indices = unpack(flat, b.bits, n * b.dim).reshape(n, b.dim).astype(np.uint8)
+            comp = CompressedVectors(
+                indices, np.ones(n, dtype=np.float32), b.dim, b.bits
+            )
+            self._remex_docmat = self._remex_quantizer().decode(comp).astype(np.float32)
+        return self._remex_docmat
+
+    def _search_remex(
+        self, query: str, *, embedder: Embedder, k: int
+    ) -> list[tuple[int, dict[str, Any]]]:
+        self._m.validate_against_embedder(embedder.fingerprint())
+        b = self._m.binarizer
+        vec = embedder.encode([query], prompt="query")  # (1, full_dim)
+        if vec.shape != (1, self._m.embedder.full_dim):
+            raise ValueError(
+                f"embedder returned shape {vec.shape}; expected "
+                f"(1, {self._m.embedder.full_dim})"
+            )
+        # remex does not center; truncate the full-precision query directly.
+        q_trunc = np.ascontiguousarray(vec[0, : b.dim].astype(np.float32))
+        scores = self._remex_doc_matrix() @ q_trunc           # higher = closer
+        dists = np.rint((1.0 - scores) * 10000.0).astype(np.int64)
+        idx = top_k(dists, k=k)
+        return [(int(dists[i]), self._chunks[int(i)]) for i in idx]
