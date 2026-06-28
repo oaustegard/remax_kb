@@ -2,6 +2,7 @@
 # Torch-free — suitable for claude.ai project containers.
 numpy>=1.24
 scipy>=1.10
+bm25s>=0.2
 onnxruntime>=1.17
 tokenizers>=0.15
 remax @ git+https://github.com/oaustegard/remax.git
