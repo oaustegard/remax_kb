@@ -142,10 +142,14 @@ clients to detect updates without re-parsing the body.
 
 `prompts.*` — identical semantics to v1.
 
+`binarizer.kind` — `"remax-centered-simhash"` (default, 1-bit) or
+`"remex-lloyd-max"` (optional multi-bit; see §remex codec below). A reader MUST
+refuse unknown kinds.
+
 `binarizer.projection` — `"haar"` (default) or `"rademacher"`. Selects the
 hyperplane family and, decisively, whether the rotation is *shipped* or
 *regenerated* — see §projection below. With `"rademacher"` the `.kbi` carries no
-rotation entry and `rotations_quant` is `"none"`.
+rotation entry and `rotations_quant` is `"none"`. Not present for the remex codec.
 
 `binarizer.*` — identical semantics to v1, plus the optional
 `binarizer.rotations_quant` (`"float32"` default, or `"int8"`) which
@@ -195,11 +199,37 @@ on lazy fetch.
 
 ## `vectors.bin`
 
-Identical layout to v1: `total_rows × (dim * k // 8)` bytes,
-row-major, no header. Row `i` is the stacked-SimHash code for the
-chunk at row `i`. Tombstoned rows still have their bits — the reader
-skips them via `chunk_map.bin` flags, not by absence from the
-vectors file.
+Identical layout to v1: `total_rows × row_bytes` bytes, row-major, no
+header, where `row_bytes = dim * k // 8` for the remax codec and
+`dim * bits // 8` for the remex codec. Row `i` is the code for the chunk
+at row `i`. Tombstoned rows still have their bits — the reader skips them
+via `chunk_map.bin` flags, not by absence from the vectors file.
+
+## §remex codec
+
+`binarizer.kind == "remex-lloyd-max"` selects multi-bit Lloyd-Max scalar
+quantization (rotation + per-coordinate quantization) instead of 1-bit
+SimHash — higher fidelity to the float ranking on general (isotropic)
+embedders such as Jina; on specialized, tightly-clustered embedders (e.g.
+SPECTER2) 1-bit can win, so it is a per-embedder choice. The binarizer block
+carries `"bits"` (1–8) and `"k": 1`, and omits `projection` /
+`rotations_quant`. Differences from the remax codec, all manifest-visible:
+
+- **No centering.** `mean_vector_b64` is all zeros; the reader truncates the
+  query to `dim` and scores by inner product (centering measurably hurts
+  remex). This holds across `sync`/`compact` re-encodes.
+- **`vectors.bin`** is the per-row bit-packed `uint8` index array
+  (`remex.pack`), `dim * bits` bits/row, byte-aligned. The reader recovers
+  indices with `remex.unpack`, wraps them in a `remex.CompressedVectors`
+  (norms reconstructed as `1.0` — the codec requires an L2-normalizing
+  embedder, so per-row norms are not stored), decodes, and ranks by inner
+  product against the query.
+- **No rotation sidecar** — the Haar rotation and Lloyd-Max boundaries are
+  derived from `(dim, bits, seed)` alone.
+- **Dense distance** reported by the reader is an integer angular distance
+  `round((1 − cosine) · 10000)` (ascending, ≈0 for a near-identical match),
+  so RRF / hybrid fusion is unchanged.
+- **Dependency:** the reader imports `remex` only for this kind.
 
 ## `chunk_map.bin`
 

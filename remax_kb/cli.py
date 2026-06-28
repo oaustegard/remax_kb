@@ -57,9 +57,6 @@ def _build_embedder(name: str, args: argparse.Namespace):
 # --------------------------------------------------------------------------- #
 def _cmd_pack(args: argparse.Namespace) -> int:
     if args.v2:
-        if getattr(args, "codec", "remax") != "remax":
-            print("--codec remex is only supported for v1 .kb (not --v2)", file=sys.stderr)
-            return 2
         return _cmd_pack_v2(args)
 
     from . import pack_directory
@@ -104,6 +101,8 @@ def _cmd_pack_v2(args: argparse.Namespace) -> int:
         dim=args.dim,
         k=args.k,
         seed=args.seed,
+        codec=args.codec,
+        bits=args.bits,
         source=args.source,
     )
     writer.add_chunks(chunks)
@@ -300,6 +299,7 @@ def _cmd_info_v2(args: argparse.Namespace) -> int:
             "kind": m["binarizer"]["kind"],
             "dim": m["binarizer"]["dim"],
             "k": m["binarizer"]["k"],
+            "bits": m["binarizer"].get("bits", 1),
             "seed": m["binarizer"]["seed"],
         },
         "lexical": m.get("lexical"),
@@ -376,7 +376,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pack_p.add_argument("--k", type=int, default=8, help="stacked-SimHash stack count (default 8; remax codec only)")
     pack_p.add_argument("--seed", type=int, default=0, help="RNG seed (default 0)")
     pack_p.add_argument("--codec", choices=("remax", "remex"), default="remax",
-                        help="vector codec: remax 1-bit SimHash (default) or remex multi-bit Lloyd-Max (v1 .kb only)")
+                        help="vector codec: remax 1-bit SimHash (default) or remex multi-bit Lloyd-Max (v1 and v2)")
     pack_p.add_argument("--bits", type=int, default=4,
                         help="bits/coord for --codec remex (1..8, default 4)")
     pack_p.add_argument("--source", default="", help="free-text source description")

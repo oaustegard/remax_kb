@@ -151,7 +151,8 @@ ranking far more faithfully than 1-bit at equal bytes (`bench/RESULTS.md`).
 On specialized, tightly-clustered embedders (e.g. SPECTER2) the ordering
 can invert and 1-bit wins — so it's a per-embedder choice. remex does not
 center, requires an L2-normalizing embedder, and is deterministic from
-`(dim, bits, seed)`. v1 `.kb` only (not `--v2` yet).
+`(dim, bits, seed)`. Works for both v1 `.kb` and v2 `.kbi` (`--v2 --codec
+remex --bits 4`); under v2 it fuses with BM25 like the default codec.
 
 ### Query a `.kb`
 

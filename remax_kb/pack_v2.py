@@ -29,6 +29,7 @@ from .pack import Chunk  # reuse v1 Chunk dataclass
 SPEC_VERSION = "2"
 KIND = "split-index"
 BINARIZER_KIND = "remax-centered-simhash"
+REMEX_KIND = "remex-lloyd-max"  # optional multi-bit Lloyd-Max codec (no centering)
 
 ROW_BYTES_CHUNK_MAP = 24
 FLAG_TOMBSTONE = 0x01
@@ -102,6 +103,8 @@ class KBWriter:
         rotations_quant: str = "float32",
         projection: str = "haar",
         srht_rounds: int = 3,
+        codec: str = "remax",
+        bits: int = 4,
     ):
         if dim % 8 != 0:
             raise ValueError(f"dim must be a multiple of 8, got {dim}")
@@ -109,6 +112,15 @@ class KBWriter:
             raise ValueError(f"rotations_quant must be 'float32' or 'int8', got {rotations_quant!r}")
         if projection not in ("haar", "rademacher", "srht"):
             raise ValueError(f"projection must be 'haar', 'rademacher', or 'srht', got {projection!r}")
+        if codec not in ("remax", "remex"):
+            raise ValueError(f"codec must be 'remax' or 'remex', got {codec!r}")
+        if codec == "remex":
+            if not (1 <= bits <= 8):
+                raise ValueError(f"remex bits must be in 1..8, got {bits}")
+            if (dim * bits) % 8 != 0:
+                raise ValueError(f"remex dim*bits must be a multiple of 8, got {dim}*{bits}")
+        self._codec = codec
+        self._bits = bits
         self._name = name
         self._output_dir = Path(output_dir)
         self._embedder = embedder
@@ -119,8 +131,11 @@ class KBWriter:
         # sides and ship no rotation sidecar; rotations_quant is moot there.
         self._projection = projection
         self._srht_rounds = srht_rounds
-        self._rotations_quant = rotations_quant if projection == "haar" else "none"
+        self._rotations_quant = (
+            "none" if codec == "remex" else (rotations_quant if projection == "haar" else "none")
+        )
         self._quantizer_obj = None       # cached StackedSignBitQuantizer
+        self._remex_q = None             # cached remex.Quantizer (codec == 'remex')
         self._rotations_i8 = None        # (codes_i8, scale_f32) when int8
         self._shard_max = shard_max_bytes
         self._bm25_k1 = bm25_k1
@@ -318,12 +333,19 @@ class KBWriter:
                     f"expected {self._embedder.full_dim}"
                 )
 
-            if self._mean_vector is None:
-                self._mean_vector = new_embeddings.mean(axis=0).astype(np.float32)
+            if self._codec == "remex" and not getattr(self._embedder, "normalize_l2", True):
+                raise ValueError("remex codec requires an L2-normalizing embedder")
 
-            centered = new_embeddings - self._mean_vector
-            truncated = centered[:, : self._dim].astype(np.float32)
-            new_codes = self._get_quantizer().encode(truncated)  # (N, rowBytes) uint8
+            if self._mean_vector is None:
+                # remex does not center; carry a zero mean so the schema/reader
+                # subtract is a no-op and re-open mutation stays centering-free.
+                self._mean_vector = (
+                    np.zeros(self._embedder.full_dim, dtype=np.float32)
+                    if self._codec == "remex"
+                    else new_embeddings.mean(axis=0).astype(np.float32)
+                )
+
+            new_codes = self._encode_rows(new_embeddings)  # (N, rowBytes) uint8
 
             # Append shard bytes + chunk_ids + rows
             self._append_pending(new_codes)
@@ -488,6 +510,32 @@ class KBWriter:
     # ------------------------------------------------------------------ #
     # Internal: write artifacts
     # ------------------------------------------------------------------ #
+    @property
+    def _row_bytes(self) -> int:
+        if self._codec == "remex":
+            return self._dim * self._bits // 8
+        return self._dim * self._k // 8
+
+    def _remex_quantizer(self):
+        if self._remex_q is None:
+            from remex import Quantizer
+            self._remex_q = Quantizer(d=self._dim, bits=self._bits, seed=self._seed)
+        return self._remex_q
+
+    def _encode_rows(self, embeddings: np.ndarray) -> np.ndarray:
+        """Encode (N, full_dim) float embeddings to (N, row_bytes) uint8 codes,
+        per the active codec. remax centers on the frozen mean; remex does not."""
+        if self._codec == "remex":
+            from remex import pack as _rpack
+            truncated = np.ascontiguousarray(embeddings[:, : self._dim], dtype=np.float32)
+            comp = self._remex_quantizer().encode(truncated)
+            idx = comp.indices  # (N, dim) uint8
+            # Per-row bit-pack; dim*bits is byte-aligned so each row is row_bytes.
+            return np.stack([_rpack(np.ascontiguousarray(idx[i]), self._bits) for i in range(idx.shape[0])])
+        centered = embeddings - self._mean_vector
+        truncated = centered[:, : self._dim].astype(np.float32)
+        return self._get_quantizer().encode(truncated)
+
     def _get_quantizer(self):
         """StackedSignBitQuantizer used to encode docs AND queries, cached so
         ``commit()`` and ``_write_artifacts()`` share one rotation set. When
@@ -546,8 +594,9 @@ class KBWriter:
             # Projection sidecar — see SPEC_v2 §binarizer/rotations. The
             # 'rademacher' projection ships NOTHING (planes regenerate from
             # (dim,k,seed)); 'haar' ships f32, or int8 + per-column scale.
-            q = self._get_quantizer()
-            if self._projection in ("rademacher", "srht"):
+            if self._codec == "remex":
+                pass  # remex ships no rotation sidecar (seed-derived rotation)
+            elif self._projection in ("rademacher", "srht"):
                 pass  # no rotation entry; reader rebuilds planes from the seed
             elif self._rotations_quant == "int8":
                 codes_i8, scale_f32 = self._rotations_i8
@@ -557,7 +606,7 @@ class KBWriter:
                             np.ascontiguousarray(scale_f32, dtype="<f4").tobytes())
             else:
                 zf.writestr("binarizer/rotations.f32",
-                            q.rotations_.astype("<f4").tobytes())
+                            self._get_quantizer().rotations_.astype("<f4").tobytes())
             if bm25_files is not None:
                 for name, data in bm25_files.items():
                     zf.writestr(f"bm25/{name}", data)
@@ -618,17 +667,29 @@ class KBWriter:
             "kind": KIND,
             "embedder": embedder_block,
             "prompts": prompts,
-            "binarizer": {
-                "kind": BINARIZER_KIND,
-                "remax_version": _remax_version(),
-                "dim": self._dim,
-                "k": self._k,
-                "seed": self._seed,
-                "projection": self._projection,
-                **({"srht_rounds": self._srht_rounds} if self._projection == "srht" else {}),
-                "rotations_quant": self._rotations_quant,
-                "mean_vector_b64": _np_to_b64(self._mean_vector),
-            },
+            "binarizer": (
+                {
+                    "kind": REMEX_KIND,
+                    "remax_version": _remex_version(),
+                    "dim": self._dim,
+                    "k": 1,
+                    "bits": self._bits,
+                    "seed": self._seed,
+                    "mean_vector_b64": _np_to_b64(self._mean_vector),
+                }
+                if self._codec == "remex"
+                else {
+                    "kind": BINARIZER_KIND,
+                    "remax_version": _remax_version(),
+                    "dim": self._dim,
+                    "k": self._k,
+                    "seed": self._seed,
+                    "projection": self._projection,
+                    **({"srht_rounds": self._srht_rounds} if self._projection == "srht" else {}),
+                    "rotations_quant": self._rotations_quant,
+                    "mean_vector_b64": _np_to_b64(self._mean_vector),
+                }
+            ),
             "chunks": {
                 "uri": chunks_uri,
                 "shard_count": len(shards),
@@ -668,17 +729,21 @@ class KBWriter:
         if manifest["kind"] != KIND:
             raise ValueError(f"unsupported kind {manifest['kind']!r}")
 
-        row_bytes = manifest["binarizer"]["dim"] * manifest["binarizer"]["k"] // 8
+        bq = manifest["binarizer"]
+        self._dim = bq["dim"]
+        self._k = bq["k"]
+        self._seed = bq["seed"]
+        # Restore codec so mutation re-commits encode the same way.
+        self._codec = "remex" if bq["kind"] == REMEX_KIND else "remax"
+        self._bits = bq.get("bits", 1)
+        row_bytes = self._row_bytes
         total = manifest["chunks"]["total_rows"]
         vectors = vectors.reshape(total, row_bytes)
-        self._dim = manifest["binarizer"]["dim"]
-        self._k = manifest["binarizer"]["k"]
-        self._seed = manifest["binarizer"]["seed"]
         # Preserve projection + quantization across mutation re-commits.
-        self._projection = manifest["binarizer"].get("projection", "haar")
-        self._srht_rounds = manifest["binarizer"].get("srht_rounds", 3)
-        self._rotations_quant = manifest["binarizer"].get("rotations_quant", "float32")
-        self._mean_vector = _b64_to_np(manifest["binarizer"]["mean_vector_b64"])
+        self._projection = bq.get("projection", "haar")
+        self._srht_rounds = bq.get("srht_rounds", 3)
+        self._rotations_quant = bq.get("rotations_quant", "none" if self._codec == "remex" else "float32")
+        self._mean_vector = _b64_to_np(bq["mean_vector_b64"])
         self._version = manifest["version"]
         self._chunk_ids_bytes = bytearray(chunk_ids)
 
@@ -751,3 +816,11 @@ def _remax_version() -> str:
         return getattr(remax, "__version__", "0.0.0")
     except Exception:
         return "0.0.0"
+
+
+def _remex_version() -> str:
+    try:
+        import remex
+        return "remex-" + getattr(remex, "__version__", "0.0.0")
+    except Exception:
+        return "remex-unknown"
