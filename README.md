@@ -134,6 +134,25 @@ Frontmatter is stripped from markdown; HTML pulls main content out of
 `<article>` / `<main>` / `<body>`; PDFs use `pypdf` and emit empty
 text with a warning rather than crashing on encrypted / scanned files.
 
+#### Codec: 1-bit SimHash (default) vs multi-bit remex
+
+By default a `.kb` stores 1-bit centered-SimHash codes (`dim*k/8` B/row,
+Hamming scan). For a **higher-fidelity / mid-byte** alternative, the
+optional **remex** codec stores multi-bit Lloyd-Max scalar-quantized
+codes (`dim*bits/8` B/row):
+
+```bash
+remax-kb pack ./my-docs/ -o knowledge.kb --codec remex --bits 4 --dim 512 \
+    --embedder jina-onnx          # needs:  pip install -e ".[remex]"
+```
+
+On general (isotropic) embedders like Jina, remex reproduces the fp32
+ranking far more faithfully than 1-bit at equal bytes (`bench/RESULTS.md`).
+On specialized, tightly-clustered embedders (e.g. SPECTER2) the ordering
+can invert and 1-bit wins — so it's a per-embedder choice. remex does not
+center, requires an L2-normalizing embedder, and is deterministic from
+`(dim, bits, seed)`. v1 `.kb` only (not `--v2` yet).
+
 ### Query a `.kb`
 
 ```bash
