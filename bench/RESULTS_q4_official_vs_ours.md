@@ -41,8 +41,10 @@ that our int8 embedding-table mop-up was a Jina-specific fix Optimum's generic q
 might skip — is **refuted**: Optimum's q4 edges ours on fidelity, so it handles the
 EuroBERT embedding `Gather` at least as well. Per the issue's decision rule
 (`official ≥ ours on fidelity AND smaller → ours is dominated`), **do not upload our
-q4 to HF; close the upload loop.** `embedders.py` now steers users to the official
-asset (`model_path=onnx/model_q4.onnx`); our larger build is kept for provenance only.
+q4 to HF; close the upload loop.** `JinaQ4ONNXEmbedder` now **defaults to the official
+upstream q4** (split ONNX from `jinaai/jina-embeddings-v5-text-nano-retrieval`, pinned
+by commit + per-file sha256); our earlier build is reachable only via the example-only
+`JinaOursQ4ONNXEmbedder` subclass, kept for provenance/reproducibility.
 
 ### Docstring cross-check (passes)
 
