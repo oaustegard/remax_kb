@@ -288,6 +288,19 @@ class JinaQ4ONNXEmbedder(JinaONNXEmbedder):
     per-tensor int8 dynamic quant, which is *domain-fragile* — int8 collapsed to
     0.445 cosine on medical text where this 4-bit-blockwise path held at 0.975.
 
+    PREFER THE OFFICIAL UPSTREAM Q4 (recommended): the model authors already ship
+    ``onnx/model_q4.onnx`` in ``jinaai/jina-embeddings-v5-text-nano-retrieval``
+    (137.8 MB, HF Optimum, same MatMulNBits int4 family). A head-to-head on
+    NFCorpus (2058 docs / 100 queries, remax_kb#23) found it **dominates this
+    build** — smaller (138 vs 170 MB) and at least as faithful to fp32 on every
+    metric (per-doc cosine 0.976 vs 0.974, recall@10-vs-fp32kNN 0.870 vs 0.862,
+    Spearman rho 0.980 vs 0.976, nDCG@10 0.4291 vs 0.4250). The int8 embedding-table
+    mop-up we expected to be our edge did not materialize; Optimum's generic q4
+    handles the EuroBERT Gather at least as well. For new work, point this class
+    at the official file (``model_path=onnx/model_q4.onnx`` or
+    ``$REMAX_KB_Q4_ONNX_PATH``); fingerprint() is unchanged so .kb compat holds.
+    Our larger build is kept only for reproducibility / provenance.
+
     Sourcing the model:
       * If the q4 asset is hosted (``release_url`` set), behaves like the parent:
         downloads + SHA-verifies on first use.
