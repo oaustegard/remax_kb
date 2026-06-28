@@ -92,11 +92,27 @@ def subsample(docs, queries, qrels, n_docs, n_queries, seed=0):
 # metrics
 # --------------------------------------------------------------------------- #
 
-def encode_all(model_path, tok, docs, queries, max_length=512):
+def encode_all(model_path, tok, docs, queries, max_length=512, batch=64):
+    """Encode docs + queries, mini-batched.
+
+    JinaONNXEmbedder.encode runs its whole input as one onnxruntime batch; on a
+    real corpus (1500+ docs) the attention-mask Expand alone asks for ~26 GB and
+    OOMs. Mini-batching is numerically identical here — last-token pooling indexes
+    each row's true token length and the L2-norm is per-row, so batch boundaries
+    and per-batch padding never change a vector.
+    """
     emb = JinaONNXEmbedder(model_path=model_path, tokenizer_path=tok, max_length=max_length)
+
+    def run(texts, prompt):
+        if not texts:
+            return np.zeros((0, emb.full_dim), dtype=np.float32)
+        return np.vstack(
+            [emb.encode(texts[i : i + batch], prompt=prompt) for i in range(0, len(texts), batch)]
+        )
+
     t0 = time.time()
-    dvec = emb.encode(list(docs.values()), prompt="document")
-    qvec = emb.encode(list(queries.values()), prompt="query")
+    dvec = run(list(docs.values()), "document")
+    qvec = run(list(queries.values()), "query")
     dt = time.time() - t0
     return dvec, qvec, dt
 
@@ -153,6 +169,7 @@ def main():
     ap.add_argument("--corpus", default=None)
     ap.add_argument("--n-docs", type=int, default=1500)
     ap.add_argument("--n-queries", type=int, default=100)
+    ap.add_argument("--batch", type=int, default=64, help="forward-pass mini-batch size")
     a = ap.parse_args()
 
     docs, queries, qrels = load_nfcorpus(a.corpus)
@@ -162,7 +179,7 @@ def main():
 
     out = {}
     for name, path in [("fp32", a.fp32), ("ours-q4", a.ours_q4), ("official-q4", a.official_q4)]:
-        dvec, qvec, dt = encode_all(path, a.tokenizer, docs, queries)
+        dvec, qvec, dt = encode_all(path, a.tokenizer, docs, queries, batch=a.batch)
         ndcg, _, _ = retrieval_scores(dvec, qvec, doc_ids, query_ids, qrels)
         mb = (Path(path).stat().st_size + Path(str(path) + "_data").stat().st_size
               if Path(str(path) + "_data").exists() else Path(path).stat().st_size) / 1e6
