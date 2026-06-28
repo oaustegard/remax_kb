@@ -5,3 +5,6 @@ scipy>=1.10
 onnxruntime>=1.17
 tokenizers>=0.15
 remax @ git+https://github.com/oaustegard/remax.git
+# Needed only to read remex-codec .kb files (binarizer.kind == remex-lloyd-max).
+# numpy+scipy only; scipy is already listed above.
+remex @ git+https://github.com/oaustegard/remex.git
