@@ -185,6 +185,15 @@ def _remax_version() -> str:
         return "unknown"
 
 
+def _remex_version() -> str:
+    try:
+        import remex
+
+        return "remex-" + getattr(remex, "__version__", "0.0.0")
+    except ImportError:
+        return "remex-unknown"
+
+
 def pack(
     corpus: str | Path | Iterable[Chunk],
     out_kb: str | Path,
@@ -193,6 +202,8 @@ def pack(
     dim: int = 256,
     k: int = 8,
     seed: int = 0,
+    codec: str = "remax",
+    bits: int = 4,
     chunker: Callable[[str], list[Chunk]] | None = None,
     source_description: str = "",
     batch_size: int = 16,
@@ -207,8 +218,15 @@ def pack(
             Must also expose ``release_url`` and ``release_sha256`` attributes
             naming the *runtime* (ONNX) asset readers should fetch.
         dim: Truncation dimension. Multiple of 8, ≤ ``embedder.full_dim``.
-        k: Stacked-SimHash stack count.
-        seed: Master RNG seed for the stacked rotations.
+        k: Stacked-SimHash stack count (``codec="remax"`` only).
+        seed: Master RNG seed for the rotation(s).
+        codec: ``"remax"`` (default) = 1-bit centered SimHash, Hamming scan,
+            ``dim*k/8`` B/row. ``"remex"`` = rotation + Lloyd-Max scalar
+            quantization at ``bits`` bits/coord, ``dim*bits/8`` B/row — higher
+            fidelity to fp32 on general (isotropic) embedders like Jina. remex
+            does not center and requires an L2-normalizing embedder.
+        bits: Bits per coordinate for ``codec="remex"`` (1..8). Ignored for
+            ``"remax"``.
         chunker: Optional override; if given and corpus is a path, called on
             each file's full text. Ignored if ``corpus`` is already an
             iterable of ``Chunk``.
@@ -218,7 +236,8 @@ def pack(
     Returns:
         Path to the written .kb.
     """
-    from remax import StackedSignBitQuantizer
+    if codec not in ("remax", "remex"):
+        raise ValueError(f"codec must be 'remax' or 'remex', got {codec!r}")
 
     # ------------------------- chunking ------------------------- #
     if isinstance(corpus, (str, Path)):
@@ -264,21 +283,49 @@ def pack(
             )
         vectors[start : start + len(batch)] = out.astype(np.float32, copy=False)
 
-    # ------------------------- center + truncate + binarize ------------------------- #
-    mean_full = vectors.mean(axis=0).astype(np.float32)
-    centered = vectors - mean_full
-    truncated = np.ascontiguousarray(centered[:, :dim])
+    # ------------------------- encode ------------------------- #
+    bytes_per_row = (dim * (bits if codec == "remex" else k)) // 8
+    if codec == "remax":
+        # center on corpus mean -> truncate -> stacked 1-bit SimHash
+        from remax import StackedSignBitQuantizer
 
-    q = StackedSignBitQuantizer(d=dim, k=k, seed=seed)
-    codes = q.encode(truncated)  # (N, dim*k//8) uint8
-    bytes_per_row = (dim * k) // 8
-    if codes.shape != (len(chunks), bytes_per_row):
-        raise RuntimeError(
-            f"unexpected codes shape {codes.shape}; expected "
-            f"({len(chunks)}, {bytes_per_row})"
+        mean_full = vectors.mean(axis=0).astype(np.float32)
+        truncated = np.ascontiguousarray((vectors - mean_full)[:, :dim])
+        q = StackedSignBitQuantizer(d=dim, k=k, seed=seed)
+        codes = q.encode(truncated)  # (N, dim*k//8) uint8
+        if codes.shape != (len(chunks), bytes_per_row):
+            raise RuntimeError(
+                f"unexpected codes shape {codes.shape}; expected "
+                f"({len(chunks)}, {bytes_per_row})"
+            )
+        vectors_bin = np.ascontiguousarray(codes).tobytes()
+        binarizer = Binarizer.from_mean(
+            remax_version=_remax_version(), dim=dim, k=k, seed=seed,
+            mean_vector=mean_full,
         )
+    else:  # codec == "remex"
+        if not getattr(embedder, "normalize_l2", True):
+            raise ValueError("remex codec requires an L2-normalizing embedder")
+        if not (1 <= bits <= 8):
+            raise ValueError(f"remex bits must be in 1..8, got {bits}")
+        from remex import Quantizer, pack as remex_pack
 
-    vectors_bin = np.ascontiguousarray(codes).tobytes()
+        # remex does NOT center; truncate full-precision vectors directly.
+        truncated = np.ascontiguousarray(vectors[:, :dim])
+        qz = Quantizer(d=dim, bits=bits, seed=seed)
+        comp = qz.encode(truncated)               # CompressedVectors (indices uint8)
+        # Bit-pack indices to bits/coord. dim*bits is a multiple of 8, so the
+        # global packing is exactly len(chunks)*bytes_per_row.
+        vectors_bin = remex_pack(np.ascontiguousarray(comp.indices.ravel()), bits).tobytes()
+        if len(vectors_bin) != len(chunks) * bytes_per_row:
+            raise RuntimeError(
+                f"unexpected remex blob length {len(vectors_bin)}; expected "
+                f"{len(chunks) * bytes_per_row}"
+            )
+        binarizer = Binarizer.from_remex(
+            remax_version=_remex_version(), dim=dim, bits=bits, seed=seed,
+            full_dim=full_dim,
+        )
     chunks_jsonl = (
         "\n".join(
             json.dumps(
@@ -313,13 +360,7 @@ def pack(
             query=getattr(embedder, "prompts", {}).get("query", "Query: "),
             document=getattr(embedder, "prompts", {}).get("document", "Document: "),
         ),
-        binarizer=Binarizer.from_mean(
-            remax_version=_remax_version(),
-            dim=dim,
-            k=k,
-            seed=seed,
-            mean_vector=mean_full,
-        ),
+        binarizer=binarizer,
         corpus=CorpusInfo(
             chunk_count=len(chunks),
             build_hash=build_hash,
@@ -349,6 +390,8 @@ def pack_directory(
     dim: int = 256,
     k: int = 8,
     seed: int = 0,
+    codec: str = "remax",
+    bits: int = 4,
     source_description: str = "",
     batch_size: int = 16,
     chunker: Callable[[str, str], list[Chunk]] | None = None,
@@ -392,6 +435,8 @@ def pack_directory(
         dim=dim,
         k=k,
         seed=seed,
+        codec=codec,
+        bits=bits,
         source_description=source_description or str(Path(root).resolve()),
         batch_size=batch_size,
     )
