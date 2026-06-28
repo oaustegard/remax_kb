@@ -24,6 +24,7 @@ from ._hamming import _popcount_rows
 
 SPEC_VERSION = "2"
 KIND = "split-index"
+REMEX_KIND = "remex-lloyd-max"
 ROW_BYTES_CHUNK_MAP = 24
 FLAG_TOMBSTONE = 0x01
 
@@ -75,8 +76,11 @@ class KB:
         self._dim = b["dim"]
         self._k = b["k"]
         self._seed = b["seed"]
-        self._row_bytes = self._dim * self._k // 8
+        self._codec = "remex" if b["kind"] == REMEX_KIND else "remax"
+        self._bits = b.get("bits", 1)
+        self._row_bytes = (self._dim * self._bits // 8) if self._codec == "remex" else (self._dim * self._k // 8)
         self._total_bits = self._row_bytes * 8
+        self._remex_docmat = None  # lazily decoded corpus (remex only)
 
         import base64
         self._mean = np.frombuffer(
@@ -127,7 +131,9 @@ class KB:
             # query lands in the same sign-space the corpus was packed against.
             deq_rotations = None
             _bq = manifest.get("binarizer", {})
-            if _bq.get("projection") == "rademacher":
+            if _bq.get("kind") == REMEX_KIND:
+                pass  # remex ships no rotation sidecar; the reader rebuilds it from the seed
+            elif _bq.get("projection") == "rademacher":
                 from .projection import rademacher_planes
                 deq_rotations = rademacher_planes(_bq["dim"], _bq["k"], _bq["seed"])
             elif _bq.get("projection") == "srht":
@@ -152,7 +158,8 @@ class KB:
             raise ValueError(f"unsupported kind {manifest['kind']!r}")
 
         bin_ = manifest["binarizer"]
-        row_bytes = bin_["dim"] * bin_["k"] // 8
+        row_bytes = (bin_["dim"] * bin_.get("bits", 1) // 8) if bin_["kind"] == REMEX_KIND \
+            else (bin_["dim"] * bin_["k"] // 8)
         total = manifest["chunks"]["total_rows"]
         if len(vectors_bytes) != total * row_bytes:
             raise ValueError(
@@ -263,6 +270,20 @@ class KB:
     # ------------------------------------------------------------------ #
     # Internal: query path
     # ------------------------------------------------------------------ #
+    def _remex_doc_matrix(self) -> np.ndarray:
+        """Decode the packed remex corpus codes to approximate (N, dim) float
+        vectors once, cached. remex requires an L2-normalizing embedder, so
+        per-row norms are not stored and are reconstructed as 1.0."""
+        if self._remex_docmat is None:
+            from remex import Quantizer, unpack, CompressedVectors
+            n = self._vectors.shape[0]
+            flat = np.ascontiguousarray(self._vectors).ravel()
+            idx = unpack(flat, self._bits, n * self._dim).reshape(n, self._dim).astype(np.uint8)
+            comp = CompressedVectors(idx, np.ones(n, dtype=np.float32), self._dim, self._bits)
+            qz = Quantizer(d=self._dim, bits=self._bits, seed=self._seed)
+            self._remex_docmat = qz.decode(comp).astype(np.float32)
+        return self._remex_docmat
+
     def _dense_search(self, query: str, embedder: Embedder) -> list[Hit]:
         prompt = self._m.get("prompts", {}).get("query", "Query: ")
         # The embedder protocol takes prompt by *name* (query|document), not the literal string.
@@ -271,6 +292,24 @@ class KB:
             raise ValueError(
                 f"embedder returned dim {vec.shape[0]}; expected {self._m['embedder']['full_dim']}"
             )
+
+        if self._codec == "remex":
+            # No centering. Inner-product scan against the decoded corpus.
+            q_trunc = np.ascontiguousarray(vec[: self._dim])
+            sims = self._remex_doc_matrix() @ q_trunc            # higher = closer
+            dists = np.rint((1.0 - sims) * 10000.0).astype(np.int64)
+            SENT = 10000 * 4
+            dists[self._tombstone_mask()] = SENT
+            order = np.argsort(dists, kind="stable")
+            hits: list[Hit] = []
+            for row_idx in order:
+                d = int(dists[row_idx])
+                if d >= SENT:
+                    break
+                hits.append(Hit(row=int(row_idx), chunk_id="",
+                                dense_dist=d, dense_sim=float(sims[row_idx])))
+            return hits
+
         centered = vec - self._mean
         truncated = centered[: self._dim]
         from remax import StackedSignBitQuantizer
