@@ -77,11 +77,35 @@ JINA_V5_NANO_TOKENIZER_URL = (
 JINA_V5_NANO_FULL_DIM = 768
 JINA_V5_NANO_POOLING = "last-token"
 
-# int4-blockwise (MatMulNBits) + int8 embedding-table mop-up quant of the same
-# retrieval ONNX export. ~170 MB vs the 847 MB fp32 export; ~2x faster CPU
-# decode; retrieval parity with fp32 (NFCorpus: per-doc cosine 0.975, recall@10/
-# 100 matched). Hosted on the same mirror release as the fp32 export;
-# reproducible offline with ``scripts/build_q4_onnx.py``. See JinaQ4ONNXEmbedder.
+# ── Official upstream q4 (recommended; the q4 embedder's default) ────────────
+# The model authors ship a q4 ONNX in the retrieval export repo (HF Optimum,
+# MatMulNBits int4 — same family as our build). A head-to-head on BEIR NFCorpus
+# (remax_kb#23) found it DOMINATES our own earlier build: smaller (138 vs 170 MB)
+# AND at least as faithful to fp32 on every metric (per-doc cosine 0.976 vs
+# 0.974, recall@10-vs-fp32kNN 0.870 vs 0.862, Spearman rho 0.980 vs 0.976,
+# nDCG@10 0.4291 vs 0.4250). Split ONNX (graph + external-data weights), pinned
+# by commit + per-file sha256 (HF LFS oids verified against the pinned commit).
+JINA_V5_NANO_OFFICIAL_Q4_REPO = "jinaai/jina-embeddings-v5-text-nano-retrieval"
+JINA_V5_NANO_OFFICIAL_Q4_REVISION = "ac5d898c8d382b17167c33e5c8af644a3519b47d"
+_OFFICIAL_Q4_BASE = (
+    f"https://huggingface.co/{JINA_V5_NANO_OFFICIAL_Q4_REPO}/resolve/"
+    f"{JINA_V5_NANO_OFFICIAL_Q4_REVISION}/onnx"
+)
+JINA_V5_NANO_OFFICIAL_Q4_ONNX_URL = f"{_OFFICIAL_Q4_BASE}/model_q4.onnx"
+JINA_V5_NANO_OFFICIAL_Q4_ONNX_SHA256 = (
+    "a44811eb61f90bfcc24720c04e774ce9f5dc1d1539fe32a814aa40b16efbaa1f"
+)
+JINA_V5_NANO_OFFICIAL_Q4_DATA_URL = f"{_OFFICIAL_Q4_BASE}/model_q4.onnx_data"
+JINA_V5_NANO_OFFICIAL_Q4_DATA_SHA256 = (
+    "6f63e71508c585ac8221f0d6a3c1afd3200ab2952cbd08421e10e9aa1f9e7c46"
+)
+
+# ── Our experimental q4 build (EXAMPLE ONLY — superseded, not recommended) ───
+# int4-blockwise (MatMulNBits) + int8 embedding-table mop-up of the same
+# retrieval ONNX, ~170 MB single file. Beaten by the official q4 above on both
+# size and fidelity (remax_kb#23); kept for provenance and as a worked example
+# of how to quantize the export yourself. Loaded only via JinaOursQ4ONNXEmbedder;
+# reproducible offline with ``scripts/build_q4_onnx.py``.
 JINA_V5_NANO_Q4_ONNX_URL = f"{JINA_V5_NANO_RELEASE_BASE}/model.q4.onnx"
 JINA_V5_NANO_Q4_ONNX_SHA256 = (
     "b8b18777a9b49bafb5d14f7db3e2687b7bc60485500c39cd9febdcf1d2552e15"
@@ -122,6 +146,23 @@ def _download(url: str, dst: Path, expected_sha256: str) -> None:
             f"SHA256 mismatch on {url}: expected {expected_sha256}, got {got}"
         )
     tmp.replace(dst)
+
+
+def _download_split_onnx(
+    onnx_url, onnx_sha256, data_url, data_sha256, dstdir, *, onnx_name, data_name
+) -> Path:
+    """Download a split ONNX (graph + external-data weights) into ``dstdir``.
+
+    onnxruntime loads the graph file and resolves its external-data tensors by
+    the *relative* filename recorded inside the graph, so both files must land
+    in the same directory under their canonical upstream names. Each file is
+    SHA256-verified. Returns the graph path.
+    """
+    dstdir.mkdir(parents=True, exist_ok=True)
+    _download(data_url, dstdir / data_name, data_sha256)   # weights first
+    onnx_path = dstdir / onnx_name
+    _download(onnx_url, onnx_path, onnx_sha256)
+    return onnx_path
 
 
 # --------------------------------------------------------------------- #
@@ -272,44 +313,66 @@ class JinaONNXEmbedder:
 
 
 class JinaQ4ONNXEmbedder(JinaONNXEmbedder):
-    """int4-quantized variant of :class:`JinaONNXEmbedder` — same retrieval
-    model, ~170 MB instead of ~847 MB, ~2x faster CPU decode.
+    """int4-quantized q4 ONNX variant of :class:`JinaONNXEmbedder` — same
+    retrieval model, ~138 MB instead of ~847 MB fp32, torch-free.
 
-    Quantization: MatMulNBits 4-bit blockwise on the linear weights + int8
-    dynamic on the leftover graph (notably EuroBERT's large embedding ``Gather``,
-    which the 4-bit pass skips — without the int8 mop-up "int4" is actually
-    *larger* than int8). Built by ``scripts/build_q4_onnx.py`` from the fp32
-    export; deterministic, so the .q4 is reproducible from model.onnx + that
-    script.
+    Defaults to the model authors' **official** q4 export
+    (``jinaai/jina-embeddings-v5-text-nano-retrieval`` → ``onnx/model_q4.onnx``,
+    MatMulNBits int4 via HF Optimum). A head-to-head on BEIR NFCorpus
+    (remax_kb#23) found the official build **dominates our own earlier q4**:
+    smaller (138 vs 170 MB) and at least as faithful to fp32 on every metric
+    (per-doc cosine 0.976 vs 0.974, recall@10-vs-fp32kNN 0.870 vs 0.862,
+    Spearman rho 0.980 vs 0.976, nDCG@10 0.4291 vs 0.4250). So this class now
+    sources the official asset by default; our experimental build is available
+    only via :class:`JinaOursQ4ONNXEmbedder` (kept for provenance, not
+    recommended).
 
-    Quality: validated on BEIR NFCorpus — per-doc cosine 0.975 to fp32, recall@10
-    /@100 matched (see ``experiments/jina-int8-remax_kb`` in the muninn workspace).
-    **Experimental: validated on one corpus so far.** Prefer this over a plain
-    per-tensor int8 dynamic quant, which is *domain-fragile* — int8 collapsed to
-    0.445 cosine on medical text where this 4-bit-blockwise path held at 0.975.
+    The official q4 is a *split* ONNX (graph + ``model_q4.onnx_data`` weights);
+    both files are downloaded into the cache (pinned by commit + per-file
+    sha256) and onnxruntime resolves the external data by relative name.
 
-    PREFER THE OFFICIAL UPSTREAM Q4 (recommended): the model authors already ship
-    ``onnx/model_q4.onnx`` in ``jinaai/jina-embeddings-v5-text-nano-retrieval``
-    (137.8 MB, HF Optimum, same MatMulNBits int4 family). A head-to-head on
-    NFCorpus (2058 docs / 100 queries, remax_kb#23) found it **dominates this
-    build** — smaller (138 vs 170 MB) and at least as faithful to fp32 on every
-    metric (per-doc cosine 0.976 vs 0.974, recall@10-vs-fp32kNN 0.870 vs 0.862,
-    Spearman rho 0.980 vs 0.976, nDCG@10 0.4291 vs 0.4250). The int8 embedding-table
-    mop-up we expected to be our edge did not materialize; Optimum's generic q4
-    handles the EuroBERT Gather at least as well. For new work, point this class
-    at the official file (``model_path=onnx/model_q4.onnx`` or
-    ``$REMAX_KB_Q4_ONNX_PATH``); fingerprint() is unchanged so .kb compat holds.
-    Our larger build is kept only for reproducibility / provenance.
+    Quality vs fp32 (NFCorpus, remax_kb#23): per-doc cosine 0.976, nDCG@10 within
+    0.012 of fp32. ``fingerprint()`` is unchanged (same retrieval semantics), so a
+    .kb packed with the fp32/torch embedder is queried correctly here; only weight
+    precision differs.
 
-    Sourcing the model:
-      * If the q4 asset is hosted (``release_url`` set), behaves like the parent:
-        downloads + SHA-verifies on first use.
-      * Otherwise pass ``model_path=`` a locally-built ``model.q4.onnx``
-        (``python scripts/build_q4_onnx.py``), or set ``$REMAX_KB_Q4_ONNX_PATH``.
+    Note: q4 is **not** faster than fp32 on CPU here — int4 MatMulNBits dequant
+    offsets the smaller footprint; the win is download size, not latency.
 
-    The fingerprint() ``model_id`` is unchanged (same retrieval semantics), so a
-    .kb packed with the fp32/torch embedder is queried correctly by this runtime;
-    only weight precision differs.
+    Sourcing override: pass ``model_path=`` a local ``model_q4.onnx`` (with its
+    ``model_q4.onnx_data`` sibling alongside), or set ``$REMAX_KB_Q4_ONNX_PATH``.
+    """
+
+    # Metadata only: the official q4 is a two-file asset, not a single hosted
+    # release_url, so leave these unset (the split download lives in code).
+    release_url = None
+    release_sha256 = None
+
+    def _resolve_model(self) -> Path:
+        if self._model_path is not None:
+            return self._model_path
+        env_path = os.environ.get("REMAX_KB_Q4_ONNX_PATH")
+        if env_path:
+            return Path(env_path)
+        return _download_split_onnx(
+            JINA_V5_NANO_OFFICIAL_Q4_ONNX_URL, JINA_V5_NANO_OFFICIAL_Q4_ONNX_SHA256,
+            JINA_V5_NANO_OFFICIAL_Q4_DATA_URL, JINA_V5_NANO_OFFICIAL_Q4_DATA_SHA256,
+            _cache_root() / "jina-v5-nano" / "official-q4",
+            onnx_name="model_q4.onnx", data_name="model_q4.onnx_data",
+        )
+
+
+class JinaOursQ4ONNXEmbedder(JinaQ4ONNXEmbedder):
+    """Our earlier experimental q4 build — **EXAMPLE ONLY, not recommended**.
+
+    Superseded by the official upstream q4 (the default in the parent
+    :class:`JinaQ4ONNXEmbedder`), which is both smaller AND more faithful to fp32
+    (remax_kb#23). This single-file build — int4-blockwise MatMulNBits + an int8
+    embedding-table mop-up of EuroBERT's large ``Gather``, ~170 MB — is kept for
+    provenance and as a worked example of how to quantize the export yourself
+    (deterministic, reproducible offline with ``scripts/build_q4_onnx.py``). The
+    int8 mop-up we expected to be our edge did not materialize: Optimum's generic
+    q4 handles the embedding ``Gather`` at least as well. Prefer the parent class.
     """
 
     release_url = JINA_V5_NANO_Q4_ONNX_URL
@@ -323,10 +386,11 @@ class JinaQ4ONNXEmbedder(JinaONNXEmbedder):
             return Path(env_path)
         if not self.release_url:
             raise FileNotFoundError(
-                "JinaQ4ONNXEmbedder has no hosted q4 asset yet. Build it with "
-                "`python scripts/build_q4_onnx.py <model.onnx> model.q4.onnx` and "
-                "pass model_path=... or set $REMAX_KB_Q4_ONNX_PATH. (The fp32 "
-                "model.onnx is the source; the q4 build is deterministic.)"
+                "JinaOursQ4ONNXEmbedder has no hosted q4 asset configured. Build "
+                "it with `python scripts/build_q4_onnx.py <model.onnx> "
+                "model.q4.onnx` and pass model_path=... or set "
+                "$REMAX_KB_Q4_ONNX_PATH. (Prefer JinaQ4ONNXEmbedder — the official "
+                "upstream q4 — which this class exists only to illustrate.)"
             )
         dst = _cache_root() / "jina-v5-nano" / "model.q4.onnx"
         _download(self.release_url, dst, self.release_sha256)
