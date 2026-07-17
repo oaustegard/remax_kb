@@ -230,12 +230,44 @@ class KB:
         embedder: Embedder,
         k: int = 5,
         alpha: float | None = None,  # None → RRF; float → weighted
+        min_sim: float | str | None = None,  # dense floor; None→manifest/off, 'auto', 'off'
+        over_fetch: int | None = None,  # fusion candidate pool depth (per modality)
+        rrf_c: int = 60,  # RRF rank constant (lower = sharper toward rank-1)
     ) -> list[Hit]:
-        """Hybrid search. Returns Hit objects without chunk text/meta filled in."""
+        """Hybrid search. Returns Hit objects without chunk text/meta filled in.
+
+        Tuning knobs (all backward-compatible; omit for prior behaviour):
+
+        * ``min_sim`` — semantic floor. Dense (SimHash / inner-product) retrieval
+          always ranks *something* nearest, even for a nonsense query, so its
+          top hit earns RRF rank-credit regardless of absolute relevance. The
+          floor drops dense candidates whose ``dense_sim`` sits at or below the
+          value **before** fusion, so a query with no genuine dense match
+          contributes no spurious dense signal (and, absent any lexical hit,
+          returns nothing). ``None`` → the manifest's ``retrieval.min_sim`` if
+          present, else off. ``'auto'`` → a codec-aware noise floor scaled to the
+          bit budget and corpus size (see ``_auto_min_sim``). ``'off'`` → disable.
+          A float is used verbatim (dense_sim units: cosine for remex, fraction
+          of agreeing bits for the Hamming codec).
+        * ``over_fetch`` — how many candidates each modality contributes to
+          fusion. ``None`` → ``max(k * 8, 64)``. Deeper pools let fusion surface
+          a document that ranks mid-list in each modality but agrees across both.
+        * ``rrf_c`` — the RRF constant (default 60).
+        """
         self._validate_embedder(embedder.fingerprint())
 
         # Dense path
         dense_ranked = self._dense_search(query, embedder)
+
+        # Semantic floor: drop below-noise dense candidates before fusion so a
+        # nonsense query cannot inject a spurious "nearest" doc into the results.
+        floor = self._resolve_min_sim(min_sim)
+        if floor is not None:
+            dense_ranked = [
+                h for h in dense_ranked
+                if h.dense_sim is not None and h.dense_sim >= floor
+            ]
+
         # Lexical path (optional)
         lex_ranked = self._bm25_search(query) if self._bm25 is not None else None
 
@@ -243,9 +275,11 @@ class KB:
         if lex_ranked is None:
             top = dense_ranked[:k]
         else:
-            over_fetch = max(k * 4, 20)
+            if over_fetch is None:
+                over_fetch = max(k * 8, 64)
             top = _fuse_ranks(
-                dense_ranked, lex_ranked, over_fetch=over_fetch, alpha=alpha
+                dense_ranked, lex_ranked, over_fetch=over_fetch, alpha=alpha,
+                rrf_c=rrf_c,
             )[:k]
 
         # Enrich with chunk_id (still no text)
@@ -264,8 +298,57 @@ class KB:
         return hits
 
     def search_and_fetch(self, query: str, *, embedder: Embedder, k: int = 5,
-                         alpha: float | None = None) -> list[Hit]:
-        return self.fetch(self.search(query, embedder=embedder, k=k, alpha=alpha))
+                         alpha: float | None = None,
+                         min_sim: float | str | None = None,
+                         over_fetch: int | None = None,
+                         rrf_c: int = 60) -> list[Hit]:
+        return self.fetch(self.search(
+            query, embedder=embedder, k=k, alpha=alpha,
+            min_sim=min_sim, over_fetch=over_fetch, rrf_c=rrf_c,
+        ))
+
+    # ------------------------------------------------------------------ #
+    # Tuning: semantic floor resolution
+    # ------------------------------------------------------------------ #
+    def _resolve_min_sim(self, min_sim: float | str | None) -> float | None:
+        """Resolve the dense floor. Precedence: explicit arg > manifest
+        ``retrieval.min_sim`` > off. Accepts a float, ``'auto'``, ``'off'``/
+        ``'none'``/``''``, or ``None`` (defer to the manifest)."""
+        if min_sim is None:
+            min_sim = self._m.get("retrieval", {}).get("min_sim")
+        if min_sim is None:
+            return None
+        if isinstance(min_sim, str):
+            s = min_sim.strip().lower()
+            if s in ("off", "none", ""):
+                return None
+            if s == "auto":
+                return self._auto_min_sim()
+            raise ValueError(
+                f"min_sim must be a float, 'auto', or 'off'; got {min_sim!r}"
+            )
+        return float(min_sim)
+
+    def _auto_min_sim(self) -> float:
+        """A codec-aware noise floor for ``dense_sim``.
+
+        Complete-nonsense queries embed roughly orthogonally to every corpus
+        vector, so their similarities are noise. We floor just above the
+        expected *maximum* of ``N`` such noise similarities — the level a real
+        match must clear to be distinguishable from the best-of-N fluke — using
+        ``E[max] ≈ std * sqrt(2 ln N)`` plus a one-sigma safety margin.
+
+        * Hamming SimHash: ``dense_sim`` is the fraction of agreeing bits;
+          random agreement ~ Binomial(total_bits, ½): mean ½, std ½/√bits.
+        * remex inner product (L2-normalized): noise ~ N(0, 1/dim), so the
+          cosine noise std is 1/√dim about a zero mean.
+        """
+        import math
+        n = max(self.live_count, 2)
+        z = math.sqrt(2.0 * math.log(n)) + 1.0
+        if self._codec == "remex":
+            return z / math.sqrt(self._dim)
+        return 0.5 + z * 0.5 / math.sqrt(self._total_bits)
 
     # ------------------------------------------------------------------ #
     # Internal: query path
@@ -446,12 +529,13 @@ def _fuse_ranks(
     *,
     over_fetch: int,
     alpha: float | None,
+    rrf_c: int = 60,
 ) -> list[Hit]:
     dense_n = dense[:over_fetch]
     lex_n = lex[:over_fetch]
     if alpha is None:
         # RRF
-        C = 60
+        C = rrf_c
         merged: dict[int, Hit] = {}
         for idx, h in enumerate(dense_n):
             merged[h.row] = Hit(
