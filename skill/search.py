@@ -54,17 +54,30 @@ def _get_kb(path: str):
     return _kb_cache[key]
 
 
-def search(kb_path: str, query: str, k: int = 5, *, alpha: float | None = None) -> list[dict]:
+def search(
+    kb_path: str,
+    query: str,
+    k: int = 10,
+    *,
+    alpha: float | None = None,
+    min_sim: float | str | None = "auto",
+    over_fetch: int | None = None,
+    rrf_c: int = 60,
+) -> list[dict]:
     kb = _get_kb(kb_path)
     emb = _get_embedder()
 
     if isinstance(kb, KBv2):
-        hits = kb.search_and_fetch(query, embedder=emb, k=k, alpha=alpha)
+        hits = kb.search_and_fetch(
+            query, embedder=emb, k=k, alpha=alpha,
+            min_sim=min_sim, over_fetch=over_fetch, rrf_c=rrf_c,
+        )
         return [
             {
                 "id": h.chunk_id,
                 "fused": h.fused,
                 "dense_distance": h.dense_dist,
+                "dense_sim": h.dense_sim,
                 "bm25_score": h.bm25_score,
                 "verified": h.verified,
                 "text": h.text,
@@ -103,7 +116,11 @@ def _main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--kb", help="path to .kb (v1) or .kbi (v2) (default: auto-resolve)")
     ap.add_argument("--query", required=True, help="user query string")
-    ap.add_argument("--k", type=int, default=5, help="number of results")
+    ap.add_argument(
+        "--k", type=int, default=10,
+        help="max results (a cap, not a target — the semantic floor is the "
+        "real quality gate; a narrow query returns fewer). Default 10.",
+    )
     ap.add_argument(
         "--alpha",
         type=float,
@@ -111,11 +128,41 @@ def _main() -> int:
         help="(v2 only) fusion weight; omit for RRF, set 0..1 for weighted",
     )
     ap.add_argument(
+        "--min-sim",
+        default="auto",
+        help="(v2 only) semantic floor on dense similarity: 'auto' (default, a "
+        "codec/corpus-scaled noise floor), 'off', or a float. Drops nonsense "
+        "dense matches before fusion.",
+    )
+    ap.add_argument(
+        "--over-fetch",
+        type=int,
+        default=None,
+        help="(v2 only) fusion candidate pool depth per modality "
+        "(default max(k*8, 64)).",
+    )
+    ap.add_argument(
+        "--rrf-c",
+        type=int,
+        default=60,
+        help="(v2 only) RRF rank constant (lower = sharper toward rank-1).",
+    )
+    ap.add_argument(
         "--pretty",
         action="store_true",
         help="indent the JSON output for human reading",
     )
     args = ap.parse_args()
+
+    # --min-sim accepts 'auto'/'off' or a float; parse leniently.
+    min_sim: float | str | None = args.min_sim
+    if isinstance(min_sim, str) and min_sim.strip().lower() not in ("auto", "off", "none", ""):
+        try:
+            min_sim = float(min_sim)
+        except ValueError:
+            print(f"--min-sim must be 'auto', 'off', or a float; got {args.min_sim!r}",
+                  file=sys.stderr)
+            return 2
 
     kb_path = args.kb or _resolve_default_kb()
     if not kb_path:
@@ -126,7 +173,8 @@ def _main() -> int:
         )
         return 2
 
-    hits = search(kb_path, args.query, k=args.k, alpha=args.alpha)
+    hits = search(kb_path, args.query, k=args.k, alpha=args.alpha,
+                  min_sim=min_sim, over_fetch=args.over_fetch, rrf_c=args.rrf_c)
     indent = 2 if args.pretty else None
     print(json.dumps({"kb": kb_path, "query": args.query, "hits": hits}, indent=indent, ensure_ascii=False))
     return 0

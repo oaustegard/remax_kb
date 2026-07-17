@@ -203,12 +203,30 @@ def _cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def _min_sim_arg(value: str) -> float | str:
+    """argparse type for --min-sim: 'auto'/'off' pass through, else a float."""
+    s = value.strip().lower()
+    if s in ("auto", "off", "none", ""):
+        return s
+    try:
+        return float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--min-sim must be 'auto', 'off', or a float; got {value!r}"
+        )
+
+
 def _cmd_query_v2(args: argparse.Namespace) -> int:
     from .read_v2 import KB as KBv2
 
     embedder = _build_embedder(args.embedder, args)
     kb = KBv2.open(args.kb)
-    hits = kb.search_and_fetch(args.query, embedder=embedder, k=args.k, alpha=args.alpha)
+    hits = kb.search_and_fetch(
+        args.query, embedder=embedder, k=args.k, alpha=args.alpha,
+        min_sim=getattr(args, "min_sim", None),
+        over_fetch=getattr(args, "over_fetch", None),
+        rrf_c=getattr(args, "rrf_c", 60),
+    )
     payload = {
         "kb": str(Path(args.kb).resolve()),
         "spec_version": "2",
@@ -413,6 +431,25 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="(v2 only) fusion weight; omit for RRF, set 0..1 for weighted dense/lexical",
+    )
+    q_p.add_argument(
+        "--min-sim",
+        type=_min_sim_arg,
+        default=None,
+        help="(v2 only) semantic floor on dense similarity: 'auto', 'off', or a "
+        "float. Default off; opt in to drop nonsense dense matches before fusion.",
+    )
+    q_p.add_argument(
+        "--over-fetch",
+        type=int,
+        default=None,
+        help="(v2 only) fusion candidate pool depth per modality (default max(k*8, 64)).",
+    )
+    q_p.add_argument(
+        "--rrf-c",
+        type=int,
+        default=60,
+        help="(v2 only) RRF rank constant (lower = sharper toward rank-1).",
     )
     q_p.add_argument("--pretty", action="store_true", help="indent JSON output")
     _embedder_args(q_p)

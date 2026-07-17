@@ -46,11 +46,35 @@ It is a thin CLI wrapper around `remax_kb.KB` (v1) / `remax_kb.KBv2`
 (v2), routing on the detected format:
 
 ```bash
-python skill/search.py --kb <path_to_kb_or_kbi> --query "<user question>" --k 5
+python skill/search.py --kb <path_to_kb_or_kbi> --query "<user question>" --k 10
 ```
 
-For v2 you may pass `--alpha 0..1` to switch fusion from RRF (default)
-to weighted dense/lexical; omit it for parameter-free RRF.
+### v2 tuning knobs
+
+- **`--k`** (default 10) is a *cap*, not a target. The semantic floor is
+  the real quality gate, so a narrow query returns fewer than `k` and a
+  broad one fills to `k`. Raise it freely on a large corpus.
+- **`--min-sim`** (default `auto`) is the **semantic floor**. Dense
+  (SimHash) retrieval always ranks *something* nearest — even for a
+  nonsense query — so its top hit would otherwise earn fusion rank-credit
+  regardless of relevance. The floor drops dense candidates at or below a
+  similarity threshold *before* fusion, so a query with no genuine dense
+  match contributes no spurious dense signal (and, with no lexical hit
+  either, returns nothing). `auto` scales the floor to the codec's bit
+  budget and corpus size (the expected best-of-N noise level plus a
+  margin). Pass `off` to disable, or a float to set it explicitly
+  (dense_sim units: cosine for the remex codec, fraction of agreeing bits
+  for the Hamming codec).
+- **`--alpha 0..1`** switches fusion from RRF (default) to weighted
+  dense/lexical; omit for parameter-free RRF.
+- **`--over-fetch`** (default `max(k*8, 64)`) is how many candidates each
+  modality feeds into fusion. Deeper pools let fusion surface a document
+  that ranks mid-list in each modality but agrees across both.
+- **`--rrf-c`** (default 60) is the RRF rank constant; lower sharpens
+  toward rank-1.
+
+A per-corpus default floor can be baked into the `.kbi` manifest under
+`retrieval.min_sim`; an explicit `--min-sim` always overrides it.
 
 On first invocation per session the script downloads the ONNX
 embedder asset (`model.onnx`, ~847 MB) from the URL recorded in the
@@ -86,8 +110,14 @@ source of truth the user uploaded.
 ## Caveats
 
 - 1-bit cosine LSH is rank-correct but noisy at small `k`; lower
-  hamming distance ≠ guaranteed best answer. Surface top-3 to top-5
+  hamming distance ≠ guaranteed best answer. Surface the top handful
   and let the user adjudicate.
+- The semantic floor (`--min-sim auto`) means a genuinely-unanswerable
+  query can legitimately return **zero** hits. That is the floor working
+  as intended, not a failure — tell the user the corpus has nothing above
+  the noise floor rather than surfacing junk. If you suspect the floor is
+  too aggressive for a niche query, retry with `--min-sim off` to inspect
+  the raw ranking.
 - The skill validates that the embedder fingerprint matches the
   manifest. A mismatch is unrecoverable — tell the user the `.kb` was
   built against a different model.
