@@ -20,6 +20,10 @@ dependencies = [
 [project.optional-dependencies]
 build = [
     "torch",
+    # LFM25Embedder needs transformers<5.12 — its trust_remote_code modeling
+    # code raises "TypeError: _noncausal_shortconv_forward() got an unexpected
+    # keyword argument 'seq_idx'" on 5.12+. Left unpinned here so the Jina
+    # path is unaffected; the embedder checks at load time and says so.
     "transformers",
     "sentence-transformers",
     "peft",

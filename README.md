@@ -125,7 +125,7 @@ pip install -e .
 
 ```bash
 remax-kb pack ./my-docs/ -o knowledge.kb --dim 256 --k 8 \
-    --embedder jina-onnx          # or: gemini, jina-torch
+    --embedder jina-onnx          # or: gemini, jina-torch, lfm25
 ```
 
 Built-in handlers cover `.md / .markdown / .txt / .rst / .html / .htm
@@ -261,7 +261,7 @@ for h in kb.search_and_fetch("How does X work?", embedder=emb, k=3):
 
 ## Embedders
 
-Three implementations ship with the package; "use any embedder" is the
+Several implementations ship with the package; "use any embedder" is the
 DIY-KB pitch, and the protocol is small enough to plug your own
 provider in.
 
@@ -270,6 +270,16 @@ provider in.
 | `JinaONNXEmbedder` | torch-free, ONNX | reader / skill runtime |
 | `JinaTorchEmbedder` | heavy (torch + peft) | packer-side |
 | `GeminiEmbedder` | API (`generativelanguage.googleapis.com`) | either side; needs `$GEMINI_API_KEY` |
+| `LFM25Embedder` | heavy (torch + `transformers<5.12`) | packer-side; `LiquidAI/LFM2.5-Embedding-350M`, 1024-d, CLS pooling |
+
+`LFM25Embedder` loads with `trust_remote_code=True`; that remote code
+raises `TypeError: _noncausal_shortconv_forward() got an unexpected
+keyword argument 'seq_idx'` on transformers >= 5.12, so pin
+`transformers<5.12` (the embedder checks and says so). Its prompts are
+string prefixes — `"query: "` / `"document: "`, trailing space included —
+and it L2-normalizes manually because the upstream ST pipeline has no
+Normalize module. `encode()` mini-batches (default 8, length-sorted) —
+a one-shot encode of 1500+ docs OOMs.
 
 For Cohere / OpenAI / Voyage / your own, implement the
 [`Embedder` protocol](./remax_kb/embedders.py) — five attributes
@@ -353,7 +363,7 @@ remax_kb/
 │   ├── migrate.py                  # v1 .kb → v2 .kbi/.kbc (no re-embed)
 │   ├── formats.py                  # v1/v2 zip-layout detection
 │   ├── handlers.py                 # md/txt/html/pdf/rst extractors
-│   ├── embedders.py                # Jina ONNX/torch + Gemini wrappers
+│   ├── embedders.py                # Jina ONNX/torch + Gemini + LFM2.5 wrappers
 │   ├── cli.py                      # `remax-kb pack|query|info|migrate` CLI
 │   └── _hamming.py                 # numpy popcount scan
 ├── skill/
