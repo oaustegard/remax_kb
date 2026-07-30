@@ -16,7 +16,11 @@ Three implementations:
   ``.kb`` carries no ``release_url`` for this embedder; readers
   identify it by ``model_id`` alone.
 
-All three expose ``fingerprint()`` and ``encode(texts, prompt=...)``.
+- :class:`LFM25Embedder` — packer-side torch path for
+  ``LiquidAI/LFM2.5-Embedding-350M`` (HF-hosted, ``trust_remote_code``).
+  CLS pooling, 1024-d, manual L2 normalization, mini-batched encode.
+
+All of them expose ``fingerprint()`` and ``encode(texts, prompt=...)``.
 
 Implementing your own embedder is the recommended way to plug in
 other providers (Cohere, OpenAI, Voyage, etc.). The protocol is
@@ -647,3 +651,230 @@ class GeminiEmbedder:
 
         # 1s, 2s, 4s, 8s, 16s — capped via max_retries
         time.sleep(min(2 ** attempt, 30))
+
+
+# --------------------------------------------------------------------- #
+# LFM2.5 (Liquid AI) — torch + transformers, packer-side
+# --------------------------------------------------------------------- #
+
+
+LFM25_MODEL_ID = "LiquidAI/LFM2.5-Embedding-350M"
+LFM25_REVISION = "f35ae2c91d687658dbf1f2b449382f0b019b9808"
+LFM25_FULL_DIM = 1024
+LFM25_POOLING = "cls"
+LFM25_MAX_SEQ_LENGTH = 512  # sentence_bert_config.json
+# Prompt prefixes from the model card. The trailing space is significant —
+# these are plain string prefixes, not special tokens. The card warns that
+# omitting them silently degrades retrieval quality.
+LFM25_PROMPTS = {"query": "query: ", "document": "document: "}
+
+# ── transformers pin ────────────────────────────────────────────────────────
+# LFM2.5 loads via ``trust_remote_code=True``, and the upstream remote code
+# BREAKS on transformers >= 5.12:
+#
+#     TypeError: _noncausal_shortconv_forward() got an unexpected keyword
+#     argument 'seq_idx'
+#
+# So the packer environment must pin ``transformers<5.12``. We check the
+# installed version at load time and fail with an actionable message rather
+# than surfacing that opaque TypeError from inside the remote modeling code.
+LFM25_TRANSFORMERS_MAX_EXCLUSIVE = (5, 12)
+
+
+def _parse_major_minor(version: str) -> tuple[int, int]:
+    """Best-effort ``MAJOR.MINOR`` parse; ``(-1, -1)`` if unparseable
+    (unparseable → we don't block the user on a version we can't read)."""
+    import re
+
+    m = re.match(r"\s*(\d+)\.(\d+)", version or "")
+    if not m:
+        return (-1, -1)
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def _check_transformers_version(version: str | None = None) -> None:
+    """Raise if the installed transformers is too new for LFM2.5's remote code."""
+    if version is None:
+        import transformers
+
+        version = getattr(transformers, "__version__", "")
+    if _parse_major_minor(version) >= LFM25_TRANSFORMERS_MAX_EXCLUSIVE:
+        want = ".".join(str(p) for p in LFM25_TRANSFORMERS_MAX_EXCLUSIVE)
+        raise RuntimeError(
+            f"transformers {version} is too new for {LFM25_MODEL_ID}: its "
+            f"trust_remote_code modeling code breaks on transformers >= {want} "
+            f"with \"TypeError: _noncausal_shortconv_forward() got an unexpected "
+            f"keyword argument 'seq_idx'\". Pin `transformers<{want}` in the "
+            f"packer environment (e.g. pip install 'transformers<{want}')."
+        )
+
+
+def _to_numpy_f32(t: Any) -> np.ndarray:
+    """Torch tensor (or anything array-like) → contiguous float32 ndarray.
+
+    Written duck-typed on purpose: it keeps ``encode()`` runnable against
+    injected fakes in tests, so the unit tests need neither torch nor a
+    downloaded model.
+    """
+    for attr in ("detach", "cpu", "float"):
+        fn = getattr(t, attr, None)
+        if callable(fn):
+            t = fn()
+    to_numpy = getattr(t, "numpy", None)
+    if callable(to_numpy):
+        t = to_numpy()
+    return np.ascontiguousarray(np.asarray(t, dtype=np.float32))
+
+
+class LFM25Embedder:
+    """Liquid AI ``LFM2.5-Embedding-350M`` via torch + transformers.
+
+    Packer-side path (torch is imported lazily inside :meth:`_load`, so
+    importing this module stays torch-free). HF-hosted: there is no single
+    release asset to pin, so ``release_url``/``release_sha256`` are ``None``
+    and readers match on ``model_id`` alone — same arrangement as
+    :class:`GeminiEmbedder`.
+
+    Model facts, taken from the upstream repo (do not "fix" these by guessing):
+
+    * hidden size / ``full_dim`` = 1024
+    * pooling = **CLS**, i.e. ``last_hidden_state[:, 0]``
+      (``1_Pooling/config.json``: ``pooling_mode_cls_token: true``)
+    * prompts are **string prefixes** — ``"query: "`` / ``"document: "``,
+      trailing space included. The model card warns that dropping them
+      silently degrades retrieval.
+    * ``max_seq_length`` = 512 (``sentence_bert_config.json``)
+    * the ST pipeline has **no Normalize module**, so L2 normalization is
+      done here, manually, with a zero-norm guard.
+
+    Loading requires ``trust_remote_code=True``, and that remote code needs
+    ``transformers<5.12`` — see :data:`LFM25_TRANSFORMERS_MAX_EXCLUSIVE`.
+
+    ``encode()`` mini-batches internally (``batch_size``, default 8): a
+    one-shot encode of 1500+ documents OOMs (see
+    ``bench/RESULTS_q4_official_vs_ours.md``). Texts are sorted by length
+    before batching and scattered back to input order — padding is
+    BatchLongest, so length-sorting is worth roughly 2x. Batch boundaries
+    are numerically inert here: CLS pooling reads position 0 and the L2 norm
+    is per row.
+    """
+
+    model_id = LFM25_MODEL_ID
+    model_revision = LFM25_REVISION
+    task_adapter = "retrieval"
+    pooling = LFM25_POOLING
+    full_dim = LFM25_FULL_DIM
+    normalize_l2 = True
+    # HF-hosted; no single pinned release asset (readers match on model_id).
+    release_url: str | None = None
+    release_sha256: str | None = None
+    prompts = dict(LFM25_PROMPTS)
+
+    def __init__(
+        self,
+        *,
+        model_path: str | Path | None = None,
+        revision: str | None = None,
+        batch_size: int = 8,
+        max_length: int = LFM25_MAX_SEQ_LENGTH,
+        device: str | None = None,
+    ):
+        self._model_path = str(model_path) if model_path else self.model_id
+        self._revision = revision if revision is not None else self.model_revision
+        self._batch_size = max(1, int(batch_size))
+        self._max_length = int(max_length)
+        self._device = device
+        # Populated by _load(). Tests inject fakes here to exercise encode()
+        # without torch or a model download.
+        self._tokenizer = None
+        self._model = None
+        self._torch = None
+
+    def fingerprint(self) -> dict[str, Any]:
+        return {
+            "model_id": self.model_id,
+            "task_adapter": self.task_adapter,
+            "pooling": self.pooling,
+            "full_dim": self.full_dim,
+        }
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
+        # Lazy: torch/transformers only enter the process when we actually
+        # embed, so `import remax_kb.embedders` stays torch-free.
+        _check_transformers_version()
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        kwargs: dict[str, Any] = {"trust_remote_code": True}
+        if self._model_path == self.model_id and self._revision:
+            kwargs["revision"] = self._revision
+
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_path, **kwargs)
+        model = AutoModel.from_pretrained(self._model_path, **kwargs)
+        model.eval()
+        if self._device is None:
+            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.to(self._device)
+        self._model = model
+        self._torch = torch
+
+    def _inference_ctx(self):
+        if self._torch is not None:
+            return self._torch.inference_mode()
+        import contextlib
+
+        return contextlib.nullcontext()
+
+    def _encode_batch(self, texts: list[str]) -> np.ndarray:
+        enc = self._tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self._max_length,
+            return_tensors="pt",
+        )
+        move = getattr(enc, "to", None)
+        if self._device and callable(move):
+            enc = move(self._device)
+
+        with self._inference_ctx():
+            out = self._model(**enc)
+
+        hidden = getattr(out, "last_hidden_state", None)
+        if hidden is None:
+            hidden = out[0]  # tuple-style output
+        pooled = _to_numpy_f32(hidden[:, 0])  # CLS pooling
+
+        # No Normalize module upstream — normalize here, zero-norm guarded.
+        norms = np.linalg.norm(pooled, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        return (pooled / norms).astype(np.float32)
+
+    def encode(self, texts: list[str], *, prompt: str) -> np.ndarray:
+        if prompt not in self.prompts:
+            raise ValueError(
+                f"unknown prompt {prompt!r}; expected one of {list(self.prompts)}"
+            )
+        if not texts:
+            return np.zeros((0, self.full_dim), dtype=np.float32)
+
+        self._load()
+        prefix = self.prompts[prompt]
+        prefixed = [f"{prefix}{t}" for t in texts]
+
+        # Length-sort so each padded batch is roughly homogeneous (padding is
+        # BatchLongest ⇒ ~2x), then scatter results back to input order.
+        order = sorted(range(len(prefixed)), key=lambda i: len(prefixed[i]))
+        out = np.zeros((len(prefixed), self.full_dim), dtype=np.float32)
+        for start in range(0, len(order), self._batch_size):
+            idx = order[start : start + self._batch_size]
+            vecs = self._encode_batch([prefixed[i] for i in idx])
+            if vecs.shape != (len(idx), self.full_dim):
+                raise ValueError(
+                    f"{self.model_id} returned {vecs.shape}, expected "
+                    f"{(len(idx), self.full_dim)}"
+                )
+            out[idx] = vecs
+        return out

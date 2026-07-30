@@ -47,8 +47,12 @@ def _build_embedder(name: str, args: argparse.Namespace):
             model=args.gemini_model,
             output_dim=args.gemini_dim,
         )
+    if name == "lfm25":
+        from .embedders import LFM25Embedder
+        return LFM25Embedder()
     raise SystemExit(
-        f"unknown embedder {name!r}; choose from: jina-onnx, jina-torch, gemini"
+        f"unknown embedder {name!r}; choose from: jina-onnx, jina-torch, "
+        f"gemini, lfm25"
     )
 
 
@@ -356,7 +360,11 @@ def _embedder_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--embedder",
         default="jina-onnx",
-        help="embedder backend: jina-onnx (default), jina-torch, gemini",
+        help=(
+            "embedder backend: jina-onnx (default), jina-torch, gemini, "
+            "lfm25 (LiquidAI/LFM2.5-Embedding-350M; needs torch + "
+            "transformers<5.12)"
+        ),
     )
     p.add_argument(
         "--task-adapter",
