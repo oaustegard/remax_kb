@@ -34,5 +34,6 @@ jobs:
           python tests/gates/gate_tokenizer_parity.py
           python tests/gates/gate_cross_reader.py
           python tests/gates/gate_topk_stability.py
+          python tests/gates/gate_open_validation.py
       - name: Codec benchmark (smoke)
         run: python bench/bench_codecs.py --n 500 --queries 50

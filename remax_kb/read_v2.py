@@ -24,7 +24,12 @@ from ._hamming import _popcount_rows
 
 SPEC_VERSION = "2"
 KIND = "split-index"
+BINARIZER_KIND = "remax-centered-simhash"
 REMEX_KIND = "remex-lloyd-max"
+# SPEC_v2 §Field semantics: "A reader MUST refuse unknown kinds." Kept in sync
+# with manifest.SUPPORTED_BINARIZER_KINDS, which is v1's enforcement of the
+# same clause.
+SUPPORTED_BINARIZER_KINDS = (BINARIZER_KIND, REMEX_KIND)
 ROW_BYTES_CHUNK_MAP = 24
 FLAG_TOMBSTONE = 0x01
 
@@ -76,6 +81,9 @@ class KB:
         self._dim = b["dim"]
         self._k = b["k"]
         self._seed = b["seed"]
+        # Unknown binarizer kinds are refused at open (validation step 2), so
+        # by the time we get here "not remex" genuinely means remax rather than
+        # "anything we failed to recognise".
         self._codec = "remex" if b["kind"] == REMEX_KIND else "remax"
         self._bits = b.get("bits", 1)
         self._row_bytes = (self._dim * self._bits // 8) if self._codec == "remex" else (self._dim * self._k // 8)
@@ -104,6 +112,12 @@ class KB:
                 if req not in names:
                     raise ValueError(f"missing required entry: {req!r}")
             manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            # SPEC_v2 validation step 2 — refuse unknown spec_version/kind
+            # BEFORE anything downstream interprets the manifest. In particular
+            # the projection/rotation decode below branches on
+            # binarizer.kind, so the refusal has to come first or an unknown
+            # kind gets silently routed down the remax branch.
+            _validate_manifest_kinds(manifest)
             vectors_bytes = zf.read("vectors.bin")
             chunk_map = zf.read("chunk_map.bin")
             chunk_ids = zf.read("chunk_ids.bin")
@@ -151,12 +165,8 @@ class KB:
                 from .rotations import dequantize_int8
                 deq_rotations = dequantize_int8(_i8, _scale)
 
-        # Validate
-        if manifest["spec_version"] != SPEC_VERSION:
-            raise ValueError(f"unsupported spec_version {manifest['spec_version']!r}")
-        if manifest["kind"] != KIND:
-            raise ValueError(f"unsupported kind {manifest['kind']!r}")
-
+        # Validate — SPEC_v2 §Validation order. Step 1 (required entries) and
+        # step 2 (spec_version / kind / binarizer.kind) already ran above.
         bin_ = manifest["binarizer"]
         row_bytes = (bin_["dim"] * bin_.get("bits", 1) // 8) if bin_["kind"] == REMEX_KIND \
             else (bin_["dim"] * bin_["k"] // 8)
@@ -169,6 +179,16 @@ class KB:
             raise ValueError(
                 f"chunk_map.bin size mismatch: {len(chunk_map)} != {total} * {ROW_BYTES_CHUNK_MAP}"
             )
+        # Step 5 — every chunk_id_offset must point at a NUL-terminated valid
+        # UTF-8 id inside chunk_ids.bin. Done EAGERLY at open, not lazily in
+        # _chunk_id_at: a .kbi is designed to be fetched over HTTP from a third
+        # party, so a bad offset is attacker-influenceable input, and deferring
+        # the check meant an unlucky row raised a bare ValueError from
+        # bytes.index() somewhere deep inside search(). Cost is one pass over
+        # the id blob at open.
+        _validate_chunk_id_offsets(chunk_map, chunk_ids, total)
+
+        # Step 6
         live_count = sum(
             1 for i in range(total) if not (chunk_map[i * ROW_BYTES_CHUNK_MAP + 2] & FLAG_TOMBSTONE)
         )
@@ -177,6 +197,20 @@ class KB:
                 f"live_count mismatch: counted {live_count}, manifest says "
                 f"{manifest['chunks']['live_count']}"
             )
+
+        # Step 7 — the bm25 postings matrix must have exactly live_count rows.
+        # Without this, _bm25_search indexes scores[live_idx] against a
+        # _row_of_live built from a DIFFERENT row count: a short postings
+        # matrix silently returns the wrong documents (no exception, wrong
+        # answers), and a long one KeyErrors mid-query. js/kb-reader.js has
+        # thrown on this since it was written; Python was the outlier.
+        if bm25_retriever is not None:
+            n_docs = _bm25_num_docs(bm25_retriever)
+            if n_docs is not None and n_docs != live_count:
+                raise ValueError(
+                    f"bm25 postings row count mismatch: matrix has {n_docs} "
+                    f"rows, live_count is {live_count}"
+                )
 
         vectors = np.frombuffer(vectors_bytes, dtype=np.uint8).reshape(total, row_bytes)
         vectors = np.ascontiguousarray(vectors)
@@ -543,6 +577,82 @@ def tokenize_query(query: str) -> list[str]:
         query, stopwords=None, return_ids=False, show_progress=False
     )
     return list(toks[0]) if toks else []
+
+
+def _validate_manifest_kinds(manifest: dict[str, Any]) -> None:
+    """SPEC_v2 validation step 2 — refuse unknown ``spec_version``/``kind``.
+
+    Includes ``binarizer.kind``, which SPEC_v2 §Field semantics states as its
+    own MUST ("A reader MUST refuse unknown kinds"). v1 enforces it in
+    ``manifest.validate_static``; v2 did not, and its codec selection was
+    ``"remex" if kind == REMEX_KIND else "remax"`` — so ANY unrecognised kind
+    was silently decoded as remax centered-simhash. That produces no error and
+    no warning, just wrong bits interpreted as a valid index.
+    """
+    if manifest.get("spec_version") != SPEC_VERSION:
+        raise ValueError(
+            f"unsupported spec_version {manifest.get('spec_version')!r}; "
+            f"this reader speaks {SPEC_VERSION!r}"
+        )
+    if manifest.get("kind") != KIND:
+        raise ValueError(
+            f"unsupported kind {manifest.get('kind')!r}; "
+            f"this reader speaks {KIND!r}"
+        )
+    b_kind = manifest.get("binarizer", {}).get("kind")
+    if b_kind not in SUPPORTED_BINARIZER_KINDS:
+        raise ValueError(
+            f"unsupported binarizer kind {b_kind!r}; "
+            f"this reader speaks {SUPPORTED_BINARIZER_KINDS!r}"
+        )
+
+
+def _validate_chunk_id_offsets(
+    chunk_map: bytes, chunk_ids: bytes, total: int
+) -> None:
+    """SPEC_v2 validation step 5 — every ``chunk_id_offset`` resolves.
+
+    Each offset must lie inside ``chunk_ids.bin``, be followed by a NUL
+    terminator, and the bytes between must decode as UTF-8. Raises ValueError
+    naming the offending row.
+    """
+    n_ids = len(chunk_ids)
+    for row in range(total):
+        o = row * ROW_BYTES_CHUNK_MAP
+        (offset,) = struct.unpack_from("<Q", chunk_map, o + 16)
+        if offset >= n_ids:
+            raise ValueError(
+                f"chunk_map row {row}: chunk_id_offset {offset} is outside "
+                f"chunk_ids.bin ({n_ids} bytes)"
+            )
+        end = chunk_ids.find(0, offset)
+        if end < 0:
+            raise ValueError(
+                f"chunk_map row {row}: chunk_id at offset {offset} is not "
+                f"NUL-terminated before the end of chunk_ids.bin"
+            )
+        try:
+            chunk_ids[offset:end].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"chunk_map row {row}: chunk_id at offset {offset} is not "
+                f"valid UTF-8 ({exc})"
+            ) from exc
+
+
+def _bm25_num_docs(retriever: bm25s.BM25) -> int | None:
+    """Row count of the loaded bm25 postings matrix, or None if undiscoverable.
+
+    This is the same quantity ``js/kb-reader.js`` reads out of
+    ``bm25/params.index.json`` as ``num_docs``, and the length of the vector
+    ``BM25.get_scores`` returns — i.e. the bound that ``_bm25_search``'s
+    ``scores[live_idx]`` indexing depends on.
+    """
+    scores = getattr(retriever, "scores", None)
+    if isinstance(scores, dict) and "num_docs" in scores:
+        return int(scores["num_docs"])
+    n = getattr(retriever, "num_docs", None)
+    return int(n) if n is not None else None
 
 
 def _load_bm25_from_zip(zf: zipfile.ZipFile) -> bm25s.BM25:
