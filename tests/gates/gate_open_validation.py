@@ -419,7 +419,20 @@ def main() -> int:
             "Only the remax centered-simhash codec path is exercised: the "
             "committed fixture is 1-bit haar. The remex and srht/rademacher "
             "manifests take different branches at open and are unvalidated by "
-            "this gate."
+            "this gate. Measured, not assumed: `mutate.py --target "
+            "remax_kb/read_v2.py --max 45 -- <this gate>` kills 23/45, and "
+            "every survivor is on a codec/projection branch the fixture cannot "
+            "reach (the remex row_bytes arithmetic, the rademacher/srht/int8 "
+            "dispatch). Closing this needs fixtures in those codecs, not more "
+            "corruptions of this one."
+        )
+        g.coverage(
+            "Even the codec-specific unit tests do not close that hole: the "
+            "same mutation run against `pytest test_pack_v2_remex.py "
+            "test_srht.py test_projection.py test_int8_rotations.py "
+            "test_pack_v2.py` still leaves 15/45 alive, concentrated in the "
+            "remex `dim * bits // 8` row-width arithmetic. Nothing in this "
+            "repo currently notices if that expression changes."
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
