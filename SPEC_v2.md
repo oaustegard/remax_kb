@@ -217,8 +217,11 @@ bits for the Hamming codec, cosine for remex.
 
 This is a **hint, not a decoding parameter** — it changes which results
 are returned, never how bytes are interpreted. A reader that ignores it
-entirely is conforming (`js/kb-reader.js` does), and a caller-supplied
-floor MUST take precedence over the manifest value. It is recorded in
+entirely is conforming, and a caller-supplied floor MUST take precedence
+over the manifest value. Both shipped readers honour it as of 2026-08
+(`read_v2._resolve_min_sim`, `KBReader.resolveMinSim`), with the same
+`'auto'` derivation, because "conforming" and "returns the same results"
+are different properties and the format's value rests on the second. It is recorded in
 the artifact because the packer knows the corpus, the bit budget and
 the row count, and a querying session generally does not.
 
@@ -449,7 +452,12 @@ Python↔Node round-trip pins the matrix and the resulting codes bit-identical.
 ## `binarizer/rotations.f32`
 
 **Optional; `haar` projection only.** Pre-computed Haar rotation matrices for
-the stacked-SimHash binarizer.
+the stacked-SimHash binarizer. Optional in the format, MANDATORY for any reader
+that cannot re-derive them — which asymmetrically means every haar `.kbi` ships
+the sidecar for the benefit of consumers that may never load it. If the
+consumer is JavaScript, prefer `srht`: it is seed-only, ships nothing, and a
+sidecar-free srht `.kbi` is round-tripped through `js/kb-reader.js` by
+`tests/gates/gate_cross_reader.py`.
 
 Layout: `k × dim × dim` float32 little-endian values, concatenated.
 Total size: `k * dim * dim * 4` bytes. Rotation `j` of the k-stack
@@ -605,6 +613,9 @@ hits = kb.search(
     k=5,
     alpha=0.5,           # 0 = pure BM25, 1 = pure dense; default 0.5
     fusion="rrf",        # "rrf" | "weighted"
+    min_sim=None,        # dense floor; None = manifest retrieval.min_sim
+    over_fetch=None,     # fusion pool per modality; None = max(8k, 64)
+    rrf_c=60,            # RRF rank constant
 )
 # hits: [{"row": int, "chunk_id": str, "dense_dist": int,
 #         "bm25_score": float, "fused_score": float}, ...]
@@ -649,10 +660,12 @@ Reader MUST:
    contract.
 2. Center, truncate, encode via stacked-SimHash → query code.
 3. Hamming-scan against `vectors.bin`, skipping tombstoned rows.
-4. If BM25 present and `alpha < 1`, tokenize query, score against
+4. Apply the dense floor (see `retrieval.min_sim`) to the dense
+   candidates **before** fusion, if one is in effect.
+5. If BM25 present and `alpha < 1`, tokenize query, score against
    the bm25 index.
-5. Fuse scores via RRF or weighted sum (see fusion contract below).
-6. Return top-K with both raw scores and the fused score.
+6. Fuse scores via RRF or weighted sum (see fusion contract below).
+7. Return top-K with both raw scores and the fused score.
 
 ### `kb.fetch(hits)`
 
@@ -669,16 +682,27 @@ Reader MUST:
 
 ### Fusion contract
 
-**RRF** (default): `fused = Σ 1 / (60 + rank)` summed over each scorer
-the chunk appears in. The `60` constant is the conventional RRF
-parameter.
+**RRF** (default): `fused = Σ 1 / (C + rank)` summed over each scorer
+the chunk appears in. `C` defaults to `60`, the conventional RRF
+parameter; readers SHOULD expose it (`rrf_c` in `read_v2`, `rrfC` in
+`js/kb-reader.js`) since lowering it sharpens fusion toward rank-1.
 
 **Weighted**: `fused = alpha * dense_score + (1 - alpha) * bm25_norm`
 where `dense_score` is `1 - hamming/total_bits` and `bm25_norm` is
 min-max normalized across the top-N candidates from each scorer.
 
-Implementations SHOULD over-fetch candidates from each scorer (e.g.,
-`top_k * 4` from each) before fusion, then truncate to K.
+Implementations SHOULD over-fetch candidates from each scorer before
+fusion, then truncate to K. Both shipped readers default to
+`max(top_k * 8, 64)` per modality and expose the depth (`over_fetch` /
+`overFetch`). An earlier revision of this line suggested `top_k * 4`,
+and `js/kb-reader.js` implemented `max(4k, 20)` against Python's
+`max(8k, 64)` — so the same `.kbi` and the same query returned different
+results depending on the reader, at the defaults, which is where almost
+every caller sits. Deeper pools let fusion surface a document that ranks
+mid-list in each modality but agrees across both; that document is
+precisely what a shallow pool drops. Readers that disagree on this
+number disagree on results, so the default is now stated here rather
+than left as an example.
 
 ## Cache and freshness
 

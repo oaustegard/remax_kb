@@ -543,6 +543,12 @@ export class KBReader {
       }
     }
 
+    // Kept so callers (and the parity gate) can ask what the artifact actually
+    // shipped — in particular whether a `binarizer/rotations.*` sidecar is
+    // present, which is the whole difference between a portable seed-only
+    // `.kbi` and one that carries megabytes of Haar planes.
+    this._zipNames = zip.list();
+
     this.manifest = JSON.parse(zip.readText("manifest.json"));
     if (this.manifest.spec_version !== SPEC_VERSION) {
       throw new Error(
@@ -714,21 +720,103 @@ export class KBReader {
 
   /**
    * Run hybrid search.
+   *
+   * Every default here is the Python reader's default (`KB.search` in
+   * remax_kb/read_v2.py). They diverged until 2026-08 — this reader
+   * over-fetched `max(4k, 20)` against Python's `max(8k, 64)`, hardcoded the
+   * RRF constant, and had no semantic floor at all — which meant the same
+   * `.kbi` and the same query returned different results depending on which
+   * conforming reader you used. Parity is asserted by
+   * tests/gates/gate_cross_reader.py, which runs BOTH readers with no tuning
+   * arguments at all.
+   *
    * @param {string} query
    * @param {Float32Array} queryEmbedding - already-embedded query vector
    * @param {number} k - top-K to return
    * @param {number|null} alpha - null → RRF; number → weighted
+   * @param {number|null} overFetch - fusion pool depth per modality;
+   *   null → `defaultOverFetch(k)`
+   * @param {number} rrfC - RRF rank constant (lower = sharper toward rank-1)
+   * @param {number|string|null} minSim - dense floor in `dense_sim` units;
+   *   null → the manifest's `retrieval.min_sim`, else off; `'auto'` → a
+   *   codec-aware noise floor; `'off'` → disabled. See `resolveMinSim`.
    * @returns array of hits, NOT yet enriched with text/meta.
    */
-  search(query, queryEmbedding, { k = 5, alpha = null, overFetch = null } = {}) {
-    const dense = this._denseSearch(queryEmbedding);
-    const lex = this._bm25 ? this._bm25Search(query) : null;
-    const N = overFetch ?? Math.max(k * 4, 20);
+  search(query, queryEmbedding, {
+    k = 5, alpha = null, overFetch = null,
+    rrfC = RRF_C_DEFAULT, minSim = null,
+  } = {}) {
+    let dense = this._denseSearch(queryEmbedding);
 
+    // Semantic floor, applied BEFORE fusion (SPEC_v2 §retrieval.min_sim).
+    // Dense retrieval always ranks *something* nearest, so without this the
+    // top dense hit for a nonsense query earns RRF rank-credit regardless of
+    // whether it is relevant at all.
+    const floor = this.resolveMinSim(minSim);
+    if (floor !== null) {
+      dense = dense.filter(h => h.dense_sim != null && h.dense_sim >= floor);
+    }
+
+    const lex = this._bm25 ? this._bm25Search(query) : null;
     if (!lex) return dense.slice(0, k).map(h => this._withChunkId(h));
 
-    const fused = fuseRanks(dense, lex, N, alpha);
+    const N = overFetch ?? defaultOverFetch(k);
+    const fused = fuseRanks(dense, lex, N, alpha, rrfC);
     return fused.slice(0, k).map(h => this._withChunkId(h));
+  }
+
+  /**
+   * Resolve the dense floor. Precedence, matching `read_v2._resolve_min_sim`:
+   * explicit argument > manifest `retrieval.min_sim` > off.
+   *
+   * SPEC_v2 §retrieval.min_sim calls the manifest field "a hint, not a
+   * decoding parameter … a caller-supplied floor MUST take precedence over the
+   * manifest value" — hence the sentinel: `null`/`undefined` means "defer to
+   * the manifest", and an explicit `'off'` beats a manifest that says
+   * otherwise. It is advisory in the other direction too: a reader that
+   * ignores the field entirely is still conforming, which is what this reader
+   * did before.
+   *
+   * @param {number|string|null} minSim
+   * @returns {number|null} the floor, or null for no floor
+   */
+  resolveMinSim(minSim = null) {
+    if (minSim === null || minSim === undefined) {
+      const r = this.manifest.retrieval;
+      minSim = (r && r.min_sim !== undefined) ? r.min_sim : null;
+    }
+    if (minSim === null || minSim === undefined) return null;
+    if (typeof minSim === "string") {
+      const s = minSim.trim().toLowerCase();
+      if (s === "off" || s === "none" || s === "") return null;
+      if (s === "auto") return this.autoMinSim();
+      throw new Error(
+        `kb-reader: minSim must be a number, 'auto', or 'off'; got ` +
+        JSON.stringify(minSim)
+      );
+    }
+    return Number(minSim);
+  }
+
+  /**
+   * A codec-aware noise floor for `dense_sim`, matching `_auto_min_sim`.
+   *
+   * A nonsense query embeds roughly orthogonally to every corpus vector, so
+   * its similarities are noise; floor just above the expected *maximum* of N
+   * such noise similarities — `E[max] ≈ std·sqrt(2 ln N)` — plus one sigma of
+   * margin. For the Hamming codec `dense_sim` is the fraction of agreeing
+   * bits, so random agreement is Binomial(total_bits, ½): mean ½, std
+   * ½/√bits.
+   *
+   * (The Python reader has a second branch for remex, whose `dense_sim` is a
+   * cosine: `z / sqrt(dim)`. It is deliberately absent here — this reader
+   * refuses remex artifacts at open, so a remex branch would be unreachable
+   * code that nothing could ever test.)
+   */
+  autoMinSim() {
+    const n = Math.max(this.liveCount, 2);
+    const z = Math.sqrt(2.0 * Math.log(n)) + 1.0;
+    return 0.5 + z * 0.5 / Math.sqrt(this._totalBits);
   }
 
   _denseSearch(queryEmbedding) {
@@ -819,13 +907,26 @@ async function sha256Hex(s) {
 // Fusion
 // ─────────────────────────────────────────────────────────────────────────
 
-export function fuseRanks(dense, lex, overFetch, alpha) {
+/**
+ * Default fusion pool depth per modality — `max(8k, 64)`, the same expression
+ * `read_v2.KB.search` uses. Exported so a parity gate can compare the two
+ * readers' defaults directly instead of restating either one.
+ */
+export function defaultOverFetch(k) {
+  return Math.max(k * 8, 64);
+}
+
+export { RRF_C_DEFAULT };
+
+export function fuseRanks(dense, lex, overFetch, alpha, rrfC = RRF_C_DEFAULT) {
   const denseN = dense.slice(0, overFetch);
   const lexN = lex.slice(0, overFetch);
 
   if (alpha == null) {
-    // RRF
-    const C = 60;
+    // RRF. The constant was hardcoded at 60 here while Python exposed `rrf_c`,
+    // so a caller who sharpened Python's fusion toward rank-1 could not do the
+    // same in JS and the two readers silently ranked differently.
+    const C = rrfC;
     const merged = new Map();
     denseN.forEach((h, idx) => {
       merged.set(h.row, { ...h, fused: 1 / (C + idx + 1) });

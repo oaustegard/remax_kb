@@ -16,17 +16,30 @@ jobs:
       # js/kb-reader.js is a shipped reader of the same format; without Node
       # it is never executed and "JS compat" can only ever be Python
       # re-implementing the JS source. tests/test_reader_parity.py skips the
-      # cross-reader gate when node is absent, so this step is what makes it
-      # actually run.
+      # cross-reader AND open-validation gates when node is absent, so this
+      # step is what makes them actually run — and those two gates are the only
+      # thing asserting that the two readers decode and REFUSE alike.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: JS reader parses (fast fail before the gates shell out to node)
+        run: node --check js/kb-reader.js
       - name: Install (no torch; heavy/model/network tests self-skip)
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,remex,api,handlers,runtime]"
       - name: Run tests
         run: pytest -q
+      # Each gate exits non-zero on failure AND on INCONCLUSIVE (no known-bad
+      # or no stated coverage limit), so this step blocks on a gate that has
+      # quietly stopped being able to fail.
+      #
+      # gate_cross_reader additionally builds a --projection srht .kbi at
+      # runtime and reads it in both readers with no rotation sidecar shipped,
+      # and drives mutated copies of js/kb-reader.js (wrong sign convention,
+      # old over_fetch default, ignored rrfC, ignored manifest min_sim) to
+      # confirm each parity claim can go red. gate_open_validation does the
+      # same for the validation refusals. Both shell out to node.
       - name: Gates (full report)
         env:
           PYTHONDONTWRITEBYTECODE: "1"

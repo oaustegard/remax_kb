@@ -563,6 +563,55 @@ def main() -> int:
                         covers=("remex-lloyd-max (bits=1) is refused by name",),
                     )
 
+            # ---- the haar sidecar asymmetry, and its remedy --------------- #
+            # A haar .kbi that arrives WITHOUT binarizer/rotations.f32 is
+            # readable by Python (it re-derives the planes from (dim, k, seed)
+            # and ignores the sidecar entirely) and unreadable by JS (it
+            # cannot). That asymmetry is why every haar artifact ships up to
+            # 9 MiB of rotations for a consumer that may never load them.
+            # The requirement stays — SPEC_v2 §binarizer/rotations.f32 makes it
+            # a MUST for readers in this position — but the refusal has to name
+            # the way out, which is repacking seed-only, not hunting for a file
+            # that was never generated.
+            no_sidecar = write_kbi(
+                {k: v for k, v in pristine.items()
+                 if not k.startswith("binarizer/rotations")},
+                tmp / "no-sidecar.kbi")
+            try:
+                kb_ns = KB.open(str(no_sidecar))
+                py_ns = f"opened, live_count={kb_ns.live_count}"
+                py_opened = True
+            except Exception as exc:  # noqa: BLE001
+                py_ns, py_opened = f"{type(exc).__name__}: {exc}", False
+            g.check(py_opened,
+                    "asymmetry: the Python reader OPENS a haar .kbi with no "
+                    "rotation sidecar (it re-derives from the seed)", py_ns)
+
+            def sidecar_msg_ok(res: dict) -> bool:
+                err = (res or {}).get("error") or ""
+                return ((res or {}).get("opened") is False
+                        and "rotations.f32" in err
+                        and "--projection srht" in err)
+
+            ns_res = js_open(no_sidecar) or {}
+            g.check(sidecar_msg_ok(ns_res),
+                    "js/kb-reader.js refuses it AND names the remedy "
+                    "(repack --projection srht)",
+                    f"opened={ns_res.get('opened')} "
+                    f"error={str(ns_res.get('error'))[:220]!r}")
+            mutant = mutated_reader(
+                '          "but binarizer/rotations.f32 is absent. " + SIDECAR_REMEDY',
+                '          "but binarizer/rotations.f32 is absent."')
+            leak = js_open(no_sidecar, reader=mutant) or {}
+            g.known_bad(
+                "a refusal that names the missing file but not the remedy "
+                "leaves the caller hunting for an artifact that was never "
+                "generated",
+                rejected=not sidecar_msg_ok(leak),
+                detail=f"mutant error={str(leak.get('error'))[:160]!r}",
+                covers=("js/kb-reader.js refuses it AND names the remedy",),
+            )
+
         # ---- coverage ---------------------------------------------------- #
         g.coverage(
             "Validation is checked at OPEN only. Per-chunk sha256 verification "
@@ -604,6 +653,15 @@ def main() -> int:
             "reach (the remex row_bytes arithmetic, the rademacher/srht/int8 "
             "dispatch). Closing this needs fixtures in those codecs, not more "
             "corruptions of this one."
+        )
+        g.coverage(
+            "The sidecar asymmetry is checked at the level of the MESSAGE, not "
+            "the outcome. This gate asserts that js/kb-reader.js refuses a "
+            "sidecar-free haar .kbi and points at `--projection srht`; that "
+            "the suggested repack actually round-trips is a different claim, "
+            "made by tests/gates/gate_cross_reader.py, which builds an srht "
+            "artifact and reads it in both readers with no rotation entry "
+            "shipped."
         )
         g.coverage(
             "Parity is asserted for REFUSALS of CORRUPTED artifacts, not for "
