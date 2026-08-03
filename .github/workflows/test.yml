@@ -13,11 +13,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # js/kb-reader.js is a shipped reader of the same format; without Node
+      # it is never executed and "JS compat" can only ever be Python
+      # re-implementing the JS source. tests/test_reader_parity.py skips the
+      # cross-reader gate when node is absent, so this step is what makes it
+      # actually run.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install (no torch; heavy/model/network tests self-skip)
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,remex,api,handlers,runtime]"
       - name: Run tests
         run: pytest -q
+      - name: Reader parity gates (full report)
+        run: |
+          python tests/gates/gate_tokenizer_parity.py
+          python tests/gates/gate_cross_reader.py
       - name: Codec benchmark (smoke)
         run: python bench/bench_codecs.py --n 500 --queries 50
