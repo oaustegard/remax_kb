@@ -283,6 +283,20 @@ carries `"bits"` (1–8) and `"k": 1`, and omits `projection` /
   `round((1 − cosine) · 10000)` (ascending, ≈0 for a near-identical match),
   so RRF / hybrid fusion is unchanged.
 - **Dependency:** the reader imports `remex` only for this kind.
+- **Reader support is asymmetric, and deliberately so.** Decoding a remex row
+  needs both the Lloyd-Max centroid table and the Haar rotation, and the
+  artifact ships neither: they come out of numpy/scipy from `(dim, bits,
+  seed)` — PCG64 + Ziggurat + an explicit Householder QR, plus a
+  300-iteration Lloyd loop over the Gaussian CDF. A JavaScript reader cannot
+  reproduce either bit-for-bit, and a rotation that is merely *close* is not
+  an approximation of the right one (see §projection: mixing projections
+  "flips ~50% of code bits and collapses recall to chance"). A reader that
+  cannot decode this kind MUST refuse it **by name at open** — naming the
+  codec and a remedy — and MUST NOT fall through to the remax row width
+  `dim * k // 8`, which for some `(k, bits)` pairs coincides with
+  `dim * bits // 8` and silently Hamming-scores quantization indices.
+  `js/kb-reader.js` refuses; `remax_kb.read_v2` decodes. Pack with `--codec
+  remax --projection srht` for a browser-readable artifact.
 
 ## `chunk_map.bin`
 

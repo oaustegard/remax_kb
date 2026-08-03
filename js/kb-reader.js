@@ -4,11 +4,24 @@
 // Zero external dependencies: rolls its own ZIP_STORED reader, NPY parser,
 // Hamming popcount, BM25 scoring, and stacked-SimHash query encoder.
 //
-// Requires the .kbi to ship its rotations — either `binarizer/rotations.f32`
-// or `binarizer/rotations.i8` + `binarizer/rotations.scale.f32` when
-// `binarizer.rotations_quant == "int8"` (see SPEC_v2 §binarizer/rotations).
-// Throws on absence — bit-fidelity with NumPy's QR is impractical without
-// the shipped rotations.
+// Projections: `rademacher` and `srht` are regenerated here from the seed and
+// need NO shipped bytes — prefer them when packing for JS. `haar` requires the
+// .kbi to ship its rotations (`binarizer/rotations.f32`, or
+// `binarizer/rotations.i8` + `binarizer/rotations.scale.f32` when
+// `binarizer.rotations_quant == "int8"`; see SPEC_v2 §binarizer/rotations) and
+// throws on absence, because bit-fidelity with NumPy's QR is impractical
+// outside NumPy. The Python reader re-derives haar from (dim, k, seed) and
+// ignores the sidecar, so that asymmetry is real and the error message says
+// what to do about it.
+//
+// Codecs: `remax-centered-simhash` only. A `remex-lloyd-max` artifact is
+// REFUSED at open with an actionable message — see REMEX_REFUSAL for why
+// decoding it in JavaScript is not a matter of effort.
+//
+// Validation: this reader implements SPEC_v2 "Validation order" steps 1-7 at
+// open (step 8 needs an embedder and is the caller's). It refuses the same
+// artifacts remax_kb.read_v2 refuses; parity is asserted, on the identical
+// corrupted bytes, by tests/gates/gate_open_validation.py.
 
 // ─────────────────────────────────────────────────────────────────────────
 // Constants
@@ -16,8 +29,63 @@
 
 const SPEC_VERSION = "2";
 const KIND = "split-index";
+const BINARIZER_KIND = "remax-centered-simhash";
+const REMEX_KIND = "remex-lloyd-max";
+// SPEC_v2 §Field semantics: "A reader MUST refuse unknown kinds." Kept in sync
+// with remax_kb.read_v2.SUPPORTED_BINARIZER_KINDS. `remex-lloyd-max` is listed
+// as a *recognised* kind so it earns its own actionable refusal below rather
+// than the generic "unknown kind" one — see REMEX_REFUSAL.
+const SUPPORTED_BINARIZER_KINDS = [BINARIZER_KIND, REMEX_KIND];
 const ROW_BYTES_CHUNK_MAP = 24;
 const FLAG_TOMBSTONE = 0x01;
+const RRF_C_DEFAULT = 60;
+
+// Why this reader refuses remex outright instead of decoding it. Decoding a
+// `remex-lloyd-max` row needs BOTH the Lloyd-Max centroid table AND the Haar
+// rotation, and a remex `.kbi` ships NEITHER (SPEC_v2 §remex codec: "No
+// rotation sidecar — the Haar rotation and Lloyd-Max boundaries are derived
+// from (dim, bits, seed) alone"). Re-deriving them in JS would mean
+// reproducing, bit-for-bit:
+//   * numpy `default_rng(seed).standard_normal((d, d))` — PCG64 +
+//     SeedSequence + the Ziggurat normal sampler, in float64;
+//   * an explicit Householder QR over that matrix with Mezzadri sign
+//     correction; and
+//   * 300 Lloyd iterations driven by scipy's Gaussian CDF/PDF, where a 1-ulp
+//     erf difference moves the centroids.
+// A rotation that is merely *close* is not an approximation of the right one —
+// SPEC_v2 §projection: mixing two valid projections "flips ~50% of code bits
+// and collapses recall to chance". This is the same impossibility that makes
+// the haar sidecar mandatory, one layer deeper. A refusal is the honest
+// answer; the previous behaviour (compute `_rowBytes` as `dim*k/8`, which is
+// the WRONG width for remex's `dim*bits/8`) either threw a misleading size
+// error or — when the two happened to coincide — opened the artifact and
+// Hamming-scored quantization indices.
+// The remedy for a haar `.kbi` that arrived without its rotation sidecar.
+// This reader keeps the requirement — SPEC_v2 §binarizer/rotations.f32 makes
+// it a MUST for exactly this class of reader — but the old message
+// ("missing required entry binarizer/rotations.f32") named the symptom and
+// left the reader to guess that repacking was even an option. Every haar
+// artifact ships 9 MiB of rotations at dim=768/k=4 for a consumer that may
+// never need them; the seed-only projections exist so it does not have to.
+const SIDECAR_REMEDY =
+  "A haar .kbi MUST ship its rotations, because JavaScript cannot reproduce " +
+  "numpy's PCG64 + Ziggurat + LAPACK QR (SPEC_v2 §binarizer/rotations.f32); " +
+  "the Python reader re-derives them from (dim, k, seed) and needs no " +
+  "sidecar, which is why an artifact can reach this reader without one. " +
+  "Remedy: repack seed-only with `remax-kb pack ... --projection srht` " +
+  "(structured-orthogonal, regenerated here from (dim, k, seed, " +
+  "srht_rounds), ~Haar recall, ZERO shipped bytes) or `--projection " +
+  "rademacher`. Both round-trip through this reader with no rotation entry " +
+  "at all.";
+
+const REMEX_REFUSAL =
+  `kb-reader: binarizer.kind "${REMEX_KIND}" is not supported by this reader. ` +
+  "Decoding remex needs the Lloyd-Max centroids and the Haar rotation, both " +
+  "derived inside numpy/scipy from (dim, bits, seed), and a remex .kbi ships " +
+  "no sidecar to read them from (SPEC_v2 §remex codec). Remedy: read this " +
+  "artifact with the Python reader (remax_kb.read_v2, `pip install " +
+  "'remax-kb[remex]'`), or repack it for JS with `remax-kb pack ... --codec " +
+  "remax --projection srht`.";
 
 // ─────────────────────────────────────────────────────────────────────────
 // ZIP_STORED reader (no inflation; central-directory walk)
@@ -406,6 +474,53 @@ function readChunkId(chunkIds, offset) {
   return new TextDecoder().decode(chunkIds.subarray(offset, end));
 }
 
+// `fatal: true` makes decode() throw on malformed UTF-8 instead of silently
+// substituting U+FFFD, which is what let a corrupt chunk_id through before.
+const UTF8_STRICT = new TextDecoder("utf-8", { fatal: true });
+
+/**
+ * SPEC_v2 validation step 5 — every `chunk_id_offset` in chunk_map.bin must
+ * lie inside chunk_ids.bin, be NUL-terminated before its end, and decode as
+ * UTF-8.
+ *
+ * Done EAGERLY at open for the same reason the Python reader does it there: a
+ * `.kbi` is fetched over HTTP from a third party, so these offsets are
+ * attacker-influenceable, and deferring the check meant an unlucky row
+ * produced a garbled id (or a silent U+FFFD) in the middle of a search.
+ * Error text is deliberately close to read_v2._validate_chunk_id_offsets so
+ * the two readers are diffable when they disagree.
+ */
+function validateChunkIdOffsets(view, chunkIds, total) {
+  const n = chunkIds.length;
+  for (let row = 0; row < total; row++) {
+    const offset = Number(
+      view.getBigUint64(row * ROW_BYTES_CHUNK_MAP + 16, true)
+    );
+    if (!(offset < n)) {
+      throw new Error(
+        `kb-reader: chunk_map row ${row}: chunk_id_offset ${offset} is ` +
+        `outside chunk_ids.bin (${n} bytes)`
+      );
+    }
+    let end = offset;
+    while (end < n && chunkIds[end] !== 0) end++;
+    if (end >= n) {
+      throw new Error(
+        `kb-reader: chunk_map row ${row}: chunk_id at offset ${offset} is ` +
+        `not NUL-terminated before the end of chunk_ids.bin`
+      );
+    }
+    try {
+      UTF8_STRICT.decode(chunkIds.subarray(offset, end));
+    } catch (exc) {
+      throw new Error(
+        `kb-reader: chunk_map row ${row}: chunk_id at offset ${offset} is ` +
+        `not valid UTF-8 (${(exc && exc.message) || exc})`
+      );
+    }
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Main reader
 // ─────────────────────────────────────────────────────────────────────────
@@ -437,7 +552,19 @@ export class KBReader {
     if (this.manifest.kind !== KIND) {
       throw new Error(`kb-reader: unsupported kind ${this.manifest.kind}`);
     }
-    const bin = this.manifest.binarizer;
+    const bin = this.manifest.binarizer || {};
+    // SPEC_v2 validation step 2, third clause. This MUST come before anything
+    // interprets the binarizer block: `_rowBytes` below is codec-specific, so
+    // an unrecognised kind that fell through here was decoded as remax
+    // centered-simhash with no error and no warning — the exact v1→v2
+    // regression read_v2._validate_manifest_kinds was added to close.
+    if (!SUPPORTED_BINARIZER_KINDS.includes(bin.kind)) {
+      throw new Error(
+        `kb-reader: unsupported binarizer kind ${JSON.stringify(bin.kind)}; ` +
+        `this reader speaks ${JSON.stringify(SUPPORTED_BINARIZER_KINDS)}`
+      );
+    }
+    if (bin.kind === REMEX_KIND) throw new Error(REMEX_REFUSAL);
     this._dim = bin.dim;
     this._k = bin.k;
     this._seed = bin.seed;
@@ -466,7 +593,9 @@ export class KBReader {
       if (!zip.has("binarizer/rotations.i8") ||
           !zip.has("binarizer/rotations.scale.f32")) {
         throw new Error(
-          "kb-reader: rotations_quant=int8 but rotations.i8/scale.f32 missing"
+          "kb-reader: binarizer.rotations_quant is \"int8\" but " +
+          "binarizer/rotations.i8 and/or binarizer/rotations.scale.f32 are " +
+          "absent. " + SIDECAR_REMEDY
         );
       }
       const i8u = zip.read("binarizer/rotations.i8").slice();
@@ -497,7 +626,10 @@ export class KBReader {
       this._rotations = rot;
     } else {
       if (!zip.has("binarizer/rotations.f32")) {
-        throw new Error("kb-reader: missing required entry binarizer/rotations.f32");
+        throw new Error(
+          `kb-reader: binarizer.projection is ${JSON.stringify(projection)} ` +
+          "but binarizer/rotations.f32 is absent. " + SIDECAR_REMEDY
+        );
       }
       const rotAligned = zip.read("binarizer/rotations.f32").slice();
       this._rotations = new Float32Array(
@@ -530,8 +662,9 @@ export class KBReader {
       cmAligned.buffer, cmAligned.byteOffset, cmAligned.byteLength
     );
 
-    // chunk_ids
+    // chunk_ids — SPEC_v2 validation step 5
     this._chunkIds = zip.read("chunk_ids.bin").slice();
+    validateChunkIdOffsets(this._chunkMapView, this._chunkIds, total);
 
     // bm25 (optional)
     if (zip.has("bm25/data.csc.index.npy")) {
@@ -555,6 +688,16 @@ export class KBReader {
       } else {
         this._rowOfLive.push(i);
       }
+    }
+    // SPEC_v2 validation step 6 — the manifest's live_count must match the
+    // flags actually set in chunk_map.bin. Without bm25/ present nothing else
+    // constrains it, so a dense-only .kbi could disagree with its own manifest.
+    const declaredLive = this.manifest.chunks.live_count;
+    if (declaredLive != null && this._rowOfLive.length !== declaredLive) {
+      throw new Error(
+        `kb-reader: live_count mismatch: counted ${this._rowOfLive.length}, ` +
+        `manifest says ${declaredLive}`
+      );
     }
     if (this._bm25 && this._rowOfLive.length !== this._bm25.numDocs) {
       throw new Error(
