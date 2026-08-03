@@ -64,6 +64,100 @@ def run_js(kbi: Path, kbc: Path) -> dict:
     return json.loads(r.stdout)
 
 
+def run_probe(spec: dict, reader: Path | None = None) -> list[str]:
+    """Encode caller-supplied vectors with js/kb-reader.js's encodeQueryCode().
+
+    `reader` points the harness at a mutated copy of the reader, which is how
+    the exact-zero known-bad is driven red.
+    """
+    d = Path(tempfile.mkdtemp(prefix="jsparity-probe-"))
+    spec_path = d / "probe.json"
+    spec_path.write_text(json.dumps(spec))
+    cmd = ["node", str(HERE / "js_encode_probe.mjs"), "--spec", str(spec_path)]
+    if reader is not None:
+        cmd += ["--reader", str(reader)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"node probe failed: {r.stderr.strip()[:2000]}")
+    return json.loads(r.stdout)["codes"]
+
+
+def mutated_reader(old: str, new: str) -> Path:
+    """A copy of js/kb-reader.js with one substring replaced. Asserts the
+    substring was actually there, so a rename cannot turn the known-bad into a
+    silent no-op that "passes"."""
+    src = (ROOT / "js" / "kb-reader.js").read_text(encoding="utf-8")
+    if src.count(old) != 1:
+        raise RuntimeError(
+            f"known-bad mutation target {old!r} appears {src.count(old)} times "
+            f"in js/kb-reader.js; expected exactly 1")
+    d = Path(tempfile.mkdtemp(prefix="jsparity-mutant-"))
+    dst = d / "kb-reader.js"
+    dst.write_text(src.replace(old, new), encoding="utf-8")
+    return dst
+
+
+def exact_zero_sign_parity(g: Gate) -> None:
+    """Issue #20, mechanism (a): the sign convention AT exactly 0.0.
+
+    Constructed, not sampled. Rademacher planes have entries in {-1, +1}, so
+    for ``x = e_0 - e_1`` the projection onto output column ``c`` is
+    ``planes[j, 0, c] - planes[j, 1, c]`` — exactly 0.0 wherever those two
+    entries agree, and exactly ±2.0 where they do not. Both values are
+    representable, and both are reached by any summation order in any
+    precision: this probe isolates the *convention* from the *arithmetic*.
+
+    The anchor is the packer itself — ``remax.StackedSignBitQuantizer.encode``,
+    i.e. ``np.packbits(rotated > 0)`` — driven down the same code path
+    ``pack_v2`` uses for ``--projection rademacher``. Whatever it does with a
+    zero is by definition what the corpus bits mean.
+    """
+    from remax import StackedSignBitQuantizer
+
+    from remax_kb.projection import rademacher_planes
+
+    DIM, K, SEED = 32, 2, 12345
+    planes = rademacher_planes(DIM, K, SEED).astype(np.float32)
+    x = np.zeros(DIM, dtype=np.float32)
+    x[0], x[1] = 1.0, -1.0
+    vectors = [x, -x]
+
+    proj = np.concatenate([x @ planes[j] for j in range(K)])
+    n_zero = int((proj == 0.0).sum())
+    total_bits = DIM * K
+    g.note(f"exact-zero probe: {n_zero}/{total_bits} projected coordinates are "
+           f"exactly 0.0 (the rest are exactly ±2.0)")
+    g.bracket("the exact-zero probe actually reaches the zero case",
+              value=float(n_zero), lo=0.0, hi=float(total_bits),
+              why="0 zeros would make the sign-convention check vacuous; all "
+                  "zeros would mean the probe lost the non-zero control bits "
+                  "that prove the rest of the codeword still encodes")
+
+    q = StackedSignBitQuantizer(d=DIM, k=K, seed=SEED)
+    q.rotations_ = planes.astype(q.dtype)
+    ref = [q.encode(np.asarray(v)[None, :])[0].tobytes().hex() for v in vectors]
+
+    spec = {
+        "dim": DIM, "k": K,
+        "mean": [0.0] * DIM,
+        "rotations": [float(v) for v in planes.ravel()],
+        "vectors": [[float(t) for t in v] for v in vectors],
+    }
+    js = run_probe(spec)
+    g.check(js == ref,
+            "exact-zero projections pack the PACKER's way (strict `> 0`)",
+            f"python={ref} js={js}")
+
+    # known-bad: the convention this reader shipped with until 2026-08.
+    js_ge = run_probe(spec, reader=mutated_reader("if (sum > 0) {",
+                                                  "if (sum >= 0) {"))
+    g.known_bad("js/kb-reader.js packing on `>= 0` diverges from the packer at "
+                "an exact-zero projection",
+                rejected=js_ge != ref,
+                detail=f"packer={ref} js(>=0)={js_ge}",
+                covers=("exact-zero projections pack the PACKER's way",))
+
+
 def run_python(kbi: Path) -> dict:
     kb = KB.open(str(kbi))
     emb = DeterministicEmbedder()
@@ -251,6 +345,7 @@ def main() -> int:
             "into the comparisons below")
 
     sign_margin(g)
+    exact_zero_sign_parity(g)
     compare(g, py, js)
 
     # ---- known-bad 1: the JS reader's rotation sidecar is perturbed ------ #
@@ -326,14 +421,19 @@ def main() -> int:
 
     # ---- coverage ------------------------------------------------------- #
     g.coverage(
-        "Near-zero projection sign parity (issue #20) is NOT closed by this "
-        "gate. numpy's float32 BLAS matmul and the JS float64 accumulation "
-        "loop can still disagree on the sign of a projected coordinate that "
-        "rounds to either side of zero — and remax packs on `> 0` while "
-        "js/kb-reader.js packs on `>= 0`, so an exact 0.0 diverges by "
-        "construction. This fixture is measured to sit far from that regime "
-        "(see the sign-margin bracket); a query that does not, still can. The "
-        "xfail in tests/test_js_reader_compat.py stays."
+        "Issue #20 has TWO mechanisms and this gate closes exactly one. "
+        "(a) SIGN CONVENTION at exactly 0.0 — remax packs on `> 0`, "
+        "js/kb-reader.js packed on `>= 0`, so a projection landing on 0.0 "
+        "produced OPPOSITE bits by construction. Closed: the reader now packs "
+        "on `> 0`, and the exact-zero probe above drives a constructed 0.0 "
+        "through both the packer and Node, with a known-bad that restores "
+        "`>= 0` and goes red. (b) FLOAT SUMMATION ORDER — numpy's float32 BLAS "
+        "matmul and the JS float64 accumulation loop can still land on "
+        "opposite sides of zero for a NEAR-zero projection. NOT closed, and "
+        "not closable without one of the two readers changing arithmetic. This "
+        "fixture is measured to sit far from that regime (see the sign-margin "
+        "bracket); a query that does not, still can. The xfail in "
+        "tests/test_js_reader_compat.py stays, for mechanism (b) only."
     )
     g.coverage(
         "Only the haar/float32-sidecar configuration is covered. The int8, "
@@ -354,12 +454,12 @@ def main() -> int:
         "compared against Python."
     )
     g.coverage(
-        "Three checks are deliberately unreached by any known-bad because they "
+        "Four checks are deliberately unreached by any known-bad because they "
         "exonerate the instrument rather than assert parity: embedding "
-        "reproducibility, plane regeneration under the installed remax, and "
-        "the sign-margin bracket. All three fail loudly if the fixture and the "
-        "environment have drifted apart; none claims anything about the JS "
-        "reader."
+        "reproducibility, plane regeneration under the installed remax, the "
+        "sign-margin bracket, and the exact-zero probe's own non-vacuity "
+        "bracket. All four fail loudly if the fixture and the environment have "
+        "drifted apart; none claims anything about the JS reader."
     )
     return g.report()
 

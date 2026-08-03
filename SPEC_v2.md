@@ -234,6 +234,30 @@ header, where `row_bytes = dim * k // 8` for the remax codec and
 at row `i`. Tombstoned rows still have their bits — the reader skips them
 via `chunk_map.bin` flags, not by absence from the vectors file.
 
+### §sign convention
+
+For the remax codec a bit is `1` **iff the projected coordinate is strictly
+positive**: `bit = (x·Q > 0)`. Zero packs to `0`, together with the negatives.
+Writers and readers MUST use the same strict comparison — `remax.packing.
+encode_signs` is normative, and `numpy.packbits(rotated > 0)` is what produced
+every `vectors.bin` in existence.
+
+This is not a rounding detail. `>=` and `>` differ on exactly one input, `0.0`,
+and there they differ **totally**: the bit is inverted, by construction, in
+every precision and every summation order. Exact zeros are reachable, not
+exotic — a `rademacher` plane has entries in `{-1, +1}`, so any query whose
+contributions to a hyperplane cancel projects to exactly `0.0`.
+
+`js/kb-reader.js` packed on `>= 0` until 2026-08 and was wrong on precisely
+those coordinates (issue #20). Bit order within the byte is separately
+specified: big-endian, matching `numpy.packbits(..., bitorder='big')`.
+
+Distinct from this, and NOT resolved by fixing it: two readers computing
+`x·Q` with different float arithmetic (float32 BLAS vs a float64 accumulation
+loop) may land on opposite sides of zero for a coordinate that is merely
+*near* zero. That is a precision property of the projection, not a convention,
+and the format does not promise bit-identical codes across such readers.
+
 ## §remex codec
 
 `binarizer.kind == "remex-lloyd-max"` selects multi-bit Lloyd-Max scalar
@@ -447,7 +471,7 @@ pack time via `binarizer.rotations_quant == "int8"` (default
 `"float32"`). When present, `rotations.f32` is absent and these two
 entries replace it.
 
-The rotations feed only a sign test (`x·Q ≥ 0`), so f32 precision is
+The rotations feed only a sign test (`x·Q > 0` — see §sign convention), so f32 precision is
 unnecessary. Quantizing to int8 with a per-output-column scale shrinks
 the sidecar **4×** (`k·dim²` bytes + `k·dim·4` bytes of scale) while
 flipping a negligible fraction of code bits (~0.24% on a real

@@ -312,7 +312,15 @@ export function encodeQueryCode(qVec, mean, rotations, dim, k) {
       for (let row = 0; row < dim; row++) {
         sum += x[row] * rotations[colBase + row * dim];
       }
-      if (sum >= 0) {
+      // STRICT `> 0`, matching `remax.packing.encode_signs` ("x > 0 → bit 1;
+      // x ≤ 0 → bit 0") and `StackedSignBitQuantizer.encode`'s
+      // `np.packbits(rotated > 0)`. This reader packed on `>= 0` until 2026-08,
+      // which produced the OPPOSITE bit from the packer for any projection
+      // landing exactly on 0.0 — by construction, independent of float
+      // rounding. Exact zeros are not exotic: a query orthogonal to a plane
+      // (e.g. a ±1 rademacher plane against a vector whose contributions
+      // cancel) hits 0.0 exactly in both f32 and f64.
+      if (sum > 0) {
         // big-endian bitorder: bit `i` of byte `B` is mask (1 << (7 - i & 7))
         const bitIdx = bitBase + col;
         code[bitIdx >>> 3] |= 1 << (7 - (bitIdx & 7));
