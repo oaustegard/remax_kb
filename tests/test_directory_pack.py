@@ -172,16 +172,75 @@ def test_pack_directory_round_trip(mixed_corpus: Path, tmp_path: Path):
     assert any("page.html" in s for s in sources)
 
 
-def test_html_handler_strips_nav_footer(mixed_corpus: Path):
+@pytest.mark.parametrize("with_bs4", [True, False], ids=["bs4", "regex-fallback"])
+def test_html_handler_strips_nav_footer(mixed_corpus: Path, monkeypatch, with_bs4):
+    """handle_html's metadata contract must not depend on an optional extra.
+
+    beautifulsoup4 lives in the ``handlers`` extra, so the regex fallback is a
+    supported path, not a degraded curiosity. It used to return ``{}`` — every
+    title/description/url/date silently dropped, with the same return shape, so
+    the only symptom was worse retrieval. This test therefore runs BOTH paths;
+    the bs4 arm skips when bs4 is genuinely absent, and the fallback arm is
+    forced by making the ``bs4`` import raise.
+    """
     from remax_kb.handlers import handle_html
+
+    if with_bs4:
+        pytest.importorskip("bs4")
+    else:
+        import builtins
+
+        real_import = builtins.__import__
+
+        def no_bs4(name, *args, **kwargs):
+            if name == "bs4" or name.startswith("bs4."):
+                raise ImportError("forced: beautifulsoup4 not installed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_bs4)
 
     text, meta = handle_html(mixed_corpus / "page.html")
     assert "SKIP THIS NAV" not in text
     assert "SKIP THIS FOOTER" not in text
     assert "Reptiles" in text
-    # BS4 is installed in the dev env, so we expect title parsed:
     assert meta.get("title") == "Reptiles"
     assert meta.get("description") == "An overview of reptiles"
+    assert meta.get("kind") == "html"
+
+
+def test_html_fallback_extracts_url_and_date(tmp_path: Path, monkeypatch):
+    """The regex fallback covers the remaining two head keys too."""
+    import builtins
+
+    from remax_kb.handlers import handle_html
+
+    real_import = builtins.__import__
+
+    def no_bs4(name, *args, **kwargs):
+        if name == "bs4" or name.startswith("bs4."):
+            raise ImportError("forced")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_bs4)
+
+    p = tmp_path / "post.html"
+    p.write_text(
+        "<html><head>"
+        "<title>Tom &amp; Jerry</title>"
+        "<link rel='canonical' href='https://example.com/post'>"
+        '<meta property="article:published_time" content="2026-01-02T03:04:05Z">'
+        '<meta property="og:description" content="Cat and mouse">'
+        "</head><body><p>Body prose.</p></body></html>",
+        encoding="utf-8",
+    )
+    text, meta = handle_html(p)
+    assert meta["title"] == "Tom & Jerry"
+    assert meta["url"] == "https://example.com/post"
+    assert meta["date"] == "2026-01-02T03:04:05Z"
+    assert meta["description"] == "Cat and mouse"
+    # head contents must not leak into the extracted body text
+    assert "canonical" not in text and "article:published_time" not in text
+    assert "Body prose." in text
 
 
 def test_retrieval_lands_on_correct_file(mixed_corpus: Path, tmp_path: Path):
