@@ -259,3 +259,170 @@ def test_cli_migrate_rejects_v2_input(stub_embedder, corpus_dir: Path, tmp_path:
     rc = stub_embedder.main(["migrate", str(out), "--out", str(tmp_path / "x")])
     assert rc == 1
     assert "already spec v2" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------- #
+# v2 binarizer / retrieval flags
+#
+# KBWriter has supported `projection`, `srht_rounds`, `rotations_quant` and
+# (now) `min_sim` all along, but the CLI exposed none of them — so `srht` and
+# `rademacher`, shipped as v0.4.0 headline features with ~90 lines of normative
+# spec and a JS implementation, were unreachable from `remax-kb pack`. These
+# tests assert the flags reach the manifest, which is the only place the
+# reader (Python or JS) can see them.
+# --------------------------------------------------------------------- #
+
+
+def _v2_manifest(path: Path) -> dict:
+    import zipfile
+
+    with zipfile.ZipFile(path) as zf:
+        return json.loads(zf.read("manifest.json"))
+
+
+@pytest.mark.parametrize("projection", ["haar", "rademacher", "srht"])
+def test_cli_pack_v2_projection_flag(stub_embedder, corpus_dir: Path,
+                                     tmp_path: Path, capsys, projection):
+    out = tmp_path / f"{projection}.kbi"
+    rc = stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0", "--projection", projection]
+    )
+    assert rc == 0
+    capsys.readouterr()
+    b = _v2_manifest(out)["binarizer"]
+    assert b["projection"] == projection
+    # rademacher/srht regenerate planes from the seed and ship no sidecar
+    if projection == "haar":
+        assert b["rotations_quant"] == "float32"
+    else:
+        assert b["rotations_quant"] == "none"
+    if projection == "srht":
+        assert b["srht_rounds"] == 3
+
+
+def test_cli_pack_v2_srht_rounds_flag(stub_embedder, corpus_dir: Path,
+                                      tmp_path: Path, capsys):
+    out = tmp_path / "srht5.kbi"
+    rc = stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0",
+         "--projection", "srht", "--srht-rounds", "5"]
+    )
+    assert rc == 0
+    capsys.readouterr()
+    assert _v2_manifest(out)["binarizer"]["srht_rounds"] == 5
+
+
+def test_cli_pack_v2_rotations_quant_flag(stub_embedder, corpus_dir: Path,
+                                          tmp_path: Path, capsys):
+    import zipfile
+
+    out = tmp_path / "i8.kbi"
+    rc = stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0", "--rotations-quant", "int8"]
+    )
+    assert rc == 0
+    capsys.readouterr()
+    assert _v2_manifest(out)["binarizer"]["rotations_quant"] == "int8"
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+    assert "binarizer/rotations.i8" in names
+    assert "binarizer/rotations.scale.f32" in names
+
+
+def test_cli_pack_v2_projections_are_queryable(stub_embedder, corpus_dir: Path,
+                                               tmp_path: Path, capsys):
+    """Reaching a projection from the CLI is only worth anything if the
+    resulting artifact opens and searches."""
+    for projection in ("rademacher", "srht"):
+        out = tmp_path / f"q-{projection}.kbi"
+        stub_embedder.main(
+            ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder",
+             "stub", "--dim", "32", "--k", "4", "--seed", "0",
+             "--projection", projection]
+        )
+        capsys.readouterr()
+        rc = stub_embedder.main(
+            ["query", str(out), "cats purring", "--k", "1", "--embedder", "stub"]
+        )
+        assert rc == 0, projection
+        payload = json.loads(capsys.readouterr().out)
+        assert len(payload["hits"]) == 1, projection
+
+
+def test_cli_pack_v2_min_sim_written_and_read(stub_embedder, corpus_dir: Path,
+                                              tmp_path: Path, capsys):
+    """read_v2._resolve_min_sim has always read `retrieval.min_sim`; nothing
+    wrote it. Assert the round trip, not just the key's presence."""
+    from remax_kb.read_v2 import KB as KBv2
+
+    out = tmp_path / "floor.kbi"
+    rc = stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0", "--min-sim", "0.75"]
+    )
+    assert rc == 0
+    capsys.readouterr()
+    assert _v2_manifest(out)["retrieval"] == {"min_sim": 0.75}
+    kb = KBv2.open(str(out))
+    assert kb._resolve_min_sim(None) == 0.75          # manifest default applies
+    assert kb._resolve_min_sim(0.1) == 0.1            # explicit arg overrides
+    assert kb._resolve_min_sim("off") is None         # explicit off overrides
+
+
+def test_cli_pack_v2_min_sim_omitted_by_default(stub_embedder, corpus_dir: Path,
+                                                tmp_path: Path, capsys):
+    out = tmp_path / "nofloor.kbi"
+    stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0"]
+    )
+    capsys.readouterr()
+    assert "retrieval" not in _v2_manifest(out)
+
+
+def test_cli_pack_v2_min_sim_auto(stub_embedder, corpus_dir: Path,
+                                  tmp_path: Path, capsys):
+    from remax_kb.read_v2 import KB as KBv2
+
+    out = tmp_path / "auto.kbi"
+    stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0", "--min-sim", "auto"]
+    )
+    capsys.readouterr()
+    assert _v2_manifest(out)["retrieval"] == {"min_sim": "auto"}
+    kb = KBv2.open(str(out))
+    floor = kb._resolve_min_sim(None)
+    assert isinstance(floor, float) and 0.0 < floor < 1.0
+
+
+def test_writer_rejects_out_of_range_min_sim(tmp_path: Path):
+    from remax_kb.pack_v2 import KBWriter
+
+    with pytest.raises(ValueError, match="min_sim"):
+        KBWriter.create(name="x", output_dir=tmp_path, embedder=StubEmbedder(),
+                        dim=32, k=4, min_sim=1.5)
+    with pytest.raises(ValueError, match="min_sim"):
+        KBWriter.create(name="x", output_dir=tmp_path, embedder=StubEmbedder(),
+                        dim=32, k=4, min_sim="somewhat")
+
+
+def test_sync_preserves_min_sim_across_recommit(stub_embedder, corpus_dir: Path,
+                                                tmp_path: Path, capsys):
+    """A sync into an existing .kbi must not silently drop the floor."""
+    out = tmp_path / "s.kbi"
+    stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0", "--min-sim", "0.6"]
+    )
+    capsys.readouterr()
+    (corpus_dir / "c.txt").write_text("Birds sing at dawn.\n", encoding="utf-8")
+    rc = stub_embedder.main(
+        ["sync", str(corpus_dir), "-o", str(out), "--embedder", "stub"]
+    )
+    assert rc == 0
+    capsys.readouterr()
+    assert _v2_manifest(out)["retrieval"] == {"min_sim": 0.6}

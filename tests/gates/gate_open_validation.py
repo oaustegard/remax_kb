@@ -322,11 +322,15 @@ def main() -> int:
 
         open_src = inspect.getsource(_rv2.KB._from_bytes)
         search_src = inspect.getsource(_rv2.KB.search)
-        g.check("_validate_embedder" in search_src
-                and "_validate_embedder" not in open_src,
-                "step 8 (embedder fingerprint) is validated in search(), and "
-                "SPEC_v2 says so",
-                f"spec text: {steps.get(8, '<missing>')!r}")
+        code_at_search = ("_validate_embedder" in search_src
+                          and "_validate_embedder" not in open_src)
+        spec_8 = steps.get(8, "")
+        spec_says_search = "search()" in spec_8
+        g.check(code_at_search and spec_says_search,
+                "step 8 (embedder fingerprint): SPEC_v2 and the code agree it "
+                "happens at search(), not open()",
+                f"code_at_search={code_at_search} spec_says_search="
+                f"{spec_says_search}; spec text: {spec_8!r}")
 
         # ---- the corruptions --------------------------------------------- #
         js_results: dict[str, dict | None] = {}

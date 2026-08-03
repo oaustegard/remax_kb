@@ -205,6 +205,23 @@ per-chunk `sha256(text)` values. Leaves are ordered by row index.
 Readers MAY verify individual chunks by recomputing the Merkle path
 on lazy fetch.
 
+`retrieval.min_sim` — OPTIONAL. Default dense-similarity floor the
+packer recommends for this corpus: a float in `[0, 1]`, the string
+`"auto"`, or `"off"`. Omit the whole `retrieval` block to say nothing.
+
+Dense retrieval always ranks *something* nearest, even for a query with
+no genuine match, so its top hit earns fusion rank-credit regardless of
+absolute relevance. The floor drops dense candidates at or below the
+value **before** fusion. Units are `dense_sim`: fraction of agreeing
+bits for the Hamming codec, cosine for remex.
+
+This is a **hint, not a decoding parameter** — it changes which results
+are returned, never how bytes are interpreted. A reader that ignores it
+entirely is conforming (`js/kb-reader.js` does), and a caller-supplied
+floor MUST take precedence over the manifest value. It is recorded in
+the artifact because the packer knows the corpus, the bit budget and
+the row count, and a querying session generally does not.
+
 `built_at` — ISO-8601 UTC of the most recent commit.
 
 `source` — free-text description of the source corpus.
@@ -541,7 +558,6 @@ total rows.
 ```python
 kb = KB.open(
     index_uri="https://muninn.austegard.com/knowledge/muninn.kbi",
-    cache_dir="~/.cache/remax_kb",   # optional; default ephemeral
 )
 
 # Hybrid search — index-only, no chunk fetch
@@ -570,14 +586,22 @@ Reader MUST:
 
 1. Resolve `index_uri` to bytes via HTTP GET (or local file read for
    `file://` and bare paths).
-2. Cache the `.kbi` keyed by ETag if `cache_dir` provided.
-3. Parse `manifest.json`; refuse if `spec_version != "2"` or
-   `kind != "split-index"`.
-4. Validate that all required zip entries are present.
-5. Memmap or load `vectors.bin`, `chunk_map.bin`, `chunk_ids.bin`.
-6. If `bm25/` present, load via `bm25s.BM25.load(...)`.
-7. Resolve `manifest.chunks.uri` to an absolute URL (relative
+2. Parse `manifest.json`; refuse if `spec_version != "2"`,
+   `kind != "split-index"`, or `binarizer.kind` is not recognized.
+3. Validate that all required zip entries are present.
+4. Memmap or load `vectors.bin`, `chunk_map.bin`, `chunk_ids.bin`.
+5. If `bm25/` present, load via `bm25s.BM25.load(...)`.
+6. Resolve `manifest.chunks.uri` to an absolute URL (relative
    resolves against `index_uri`'s directory).
+
+Caching is a client concern, not a reader MUST — see §Cache and
+freshness, which states it as a SHOULD. An earlier revision of this
+list carried "Cache the `.kbi` keyed by ETag if `cache_dir` provided"
+as a numbered MUST alongside a `cache_dir` parameter in the signature
+above. No reader has ever had that parameter, so the condition could
+never be met and the requirement could never be violated. Both are
+withdrawn: an unfalsifiable MUST is worse than no MUST, because it
+reads as a conformance requirement while asserting nothing.
 
 ### `kb.search(...)`
 
@@ -636,7 +660,8 @@ when ETag isn't honored by the transport.
 A conforming reader, on opening a `.kbi`, MUST in this order:
 
 1. Confirm all required entries present.
-2. Parse `manifest.json`; refuse on unknown `spec_version` or `kind`.
+2. Parse `manifest.json`; refuse on unknown `spec_version`, `kind`,
+   or `binarizer.kind`.
 3. Compute `N = len(vectors.bin) / row_bytes`. Verify
    `N == manifest.chunks.total_rows`.
 4. Verify `len(chunk_map.bin) == N * 24`.
@@ -646,7 +671,16 @@ A conforming reader, on opening a `.kbi`, MUST in this order:
    `manifest.chunks.live_count == count`.
 7. If `bm25/` present, load and verify the postings matrix has
    `live_count` rows.
-8. Validate the embedder fingerprint (delegate, same as v1).
+8. Validate the embedder fingerprint (delegate, same as v1) — on the
+   **first `search()`**, not at open, since no embedder is supplied to
+   `KB.open`. A reader MUST refuse to search with an embedder whose
+   fingerprint disagrees with `manifest.embedder`.
+
+Steps 1–7 are open-time and depend only on the artifact. Step 8 is
+listed here because it belongs to the same validation contract, but it
+is the one step that needs an input `KB.open` does not receive. (This
+list previously said all eight happened at open, which no reader has
+ever done.)
 
 Lazy chunk fetches MUST additionally verify `sha256(text)` against
 the per-chunk header on each read.

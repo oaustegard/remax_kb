@@ -4,7 +4,9 @@ Implements the writer half of SPEC_v2.md. Supports green-field pack
 (`KBWriter.create() + add_chunks() + commit()`) and append-only
 mutation (`KBWriter.open() + add_chunks() + commit()`).
 
-Update / delete / compact are scaffolded but deferred to v2.1.
+Full mutation is implemented here, not deferred: ``add_chunks``,
+``update_chunks``, ``delete_chunks``, ``sync`` and ``compact``. (This
+docstring said "scaffolded but deferred to v2.1" long after all five landed.)
 """
 from __future__ import annotations
 
@@ -105,6 +107,7 @@ class KBWriter:
         srht_rounds: int = 3,
         codec: str = "remax",
         bits: int = 4,
+        min_sim: float | str | None = None,
     ):
         if dim % 8 != 0:
             raise ValueError(f"dim must be a multiple of 8, got {dim}")
@@ -142,6 +145,11 @@ class KBWriter:
         self._bm25_b = bm25_b
         self._chunks_uri = chunks_uri  # absolute URI; if None, relative
         self._source = source
+        # Default dense-similarity floor shipped in the manifest as
+        # `retrieval.min_sim`. read_v2._resolve_min_sim has always read this
+        # key; until now nothing wrote it, so that branch had never executed
+        # against a real artifact while skill/SKILL.md documented it to users.
+        self._min_sim = _validate_min_sim(min_sim)
 
         # Mutation state
         self._rows: list[_Row] = []         # all rows including tombstones
@@ -407,7 +415,7 @@ class KBWriter:
         self._committed = True
 
     # ------------------------------------------------------------------ #
-    # Compact (v2.1)
+    # Compact
     # ------------------------------------------------------------------ #
     def compact(self) -> None:
         """Rebuild from live rows, dropping tombstones and orphaned bytes.
@@ -701,6 +709,8 @@ class KBWriter:
             "built_at": _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
             "source": self._source,
         }
+        if self._min_sim is not None:
+            manifest["retrieval"] = {"min_sim": self._min_sim}
         if has_bm25:
             manifest["lexical"] = {
                 "kind": "bm25s",
@@ -743,6 +753,13 @@ class KBWriter:
         self._projection = bq.get("projection", "haar")
         self._srht_rounds = bq.get("srht_rounds", 3)
         self._rotations_quant = bq.get("rotations_quant", "none" if self._codec == "remex" else "float32")
+        # Preserve retrieval.min_sim across re-commits too — but unlike the
+        # projection fields it is a policy knob, not a property of the bits, so
+        # an explicit constructor argument wins over what the artifact carries.
+        if self._min_sim is None:
+            self._min_sim = _validate_min_sim(
+                manifest.get("retrieval", {}).get("min_sim")
+            )
         self._mean_vector = _b64_to_np(bq["mean_vector_b64"])
         self._version = manifest["version"]
         self._chunk_ids_bytes = bytearray(chunk_ids)
@@ -808,6 +825,36 @@ def _merkle_root(leaves: list[bytes]) -> str:
             nxt.append(hashlib.sha256(left + right).digest())
         level = nxt
     return level[0].hex()
+
+
+def _validate_min_sim(value: float | str | None) -> float | str | None:
+    """Normalize a ``retrieval.min_sim`` manifest value, or None to omit it.
+
+    Accepts the same vocabulary ``read_v2._resolve_min_sim`` accepts: a float,
+    ``'auto'``, or ``'off'``. Rejecting here rather than at read time means an
+    unusable value cannot be baked into an artifact and shipped.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("off", "none", ""):
+            return "off"
+        if s == "auto":
+            return "auto"
+        try:
+            return float(s)
+        except ValueError:
+            raise ValueError(
+                f"min_sim must be a float, 'auto', or 'off'; got {value!r}"
+            ) from None
+    v = float(value)
+    if not (0.0 <= v <= 1.0):
+        raise ValueError(
+            f"min_sim must be in [0, 1] (dense_sim units: cosine for remex, "
+            f"fraction of agreeing bits for the Hamming codec); got {v}"
+        )
+    return v
 
 
 def _remax_version() -> str:
