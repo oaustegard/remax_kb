@@ -186,17 +186,20 @@ SRHT_WORDS = [
 
 
 def build_srht_fixture(dest: Path) -> tuple[Path, Path, Path]:
-    """Build a `--projection srht` `.kbi` with the REAL writer, at runtime.
+    """Build a DEFAULT `.kbi` with the REAL writer, at runtime.
 
     Two things this fixture exists to prove, neither of which the committed
     haar fixture can:
 
-    1. **A seed-only `.kbi` round-trips through the JS reader with NO sidecar
+    1. **The DEFAULT `.kbi` round-trips through the JS reader with NO sidecar
        shipped.** `js/kb-reader.js` MUST have the rotations for `haar` and
        cannot re-derive them, which is why every haar artifact carries up to
-       9 MiB of planes for a consumer that may never need them. `srht`
-       regenerates from `(dim, k, seed, srht_rounds)` on both sides. If that
-       path works end to end, the sidecar is a choice rather than a tax.
+       9 MiB of planes for a consumer that may never need them. Since 2026-08
+       the writer defaults to `srht`, which regenerates from
+       `(dim, k, seed, srht_rounds)` on both sides — so the sidecar-free path
+       is the ordinary one, and this arm is what proves it works end to end
+       rather than in principle. No `projection=` is passed below, on purpose:
+       flip the default back to `haar` and this goes red.
     2. **The readers' DEFAULTS agree.** 200 live rows, so the fusion pools do
        not saturate at `max(4k, 20)` the way seven rows do — `over_fetch` is
        observable here, and the known-bad below shows it.
@@ -209,9 +212,14 @@ def build_srht_fixture(dest: Path) -> tuple[Path, Path, Path]:
     from remax_kb.pack_v2 import KBWriter
 
     emb = DeterministicEmbedder()
+    # NO projection argument: this fixture is built the way an ordinary caller
+    # builds one, so the gate tests the writer's DEFAULT path rather than a
+    # configuration it opted into. The assertions below then pin two things at
+    # once — that the default is seed-only, and that the default artifact reads
+    # identically in both readers.
     w = KBWriter.create(
         name="jsdefaults", output_dir=dest, embedder=emb,
-        dim=32, k=4, seed=7, projection="srht", min_sim="auto",
+        dim=32, k=4, seed=7, min_sim="auto",
     )
     corpus = []
     for i in range(200):
@@ -244,10 +252,16 @@ def defaults_parity(g: Gate) -> None:
 
     with zipfile.ZipFile(kbi) as zf:
         names = zf.namelist()
+        proj = json.loads(zf.read("manifest.json"))["binarizer"]["projection"]
     rot_entries = [n for n in names if n.startswith("binarizer/rotations")]
-    g.note(f"srht fixture: {kbi.stat().st_size} B, entries={names}")
+    g.note(f"default fixture: projection={proj}, {kbi.stat().st_size} B, "
+           f"entries={names}")
+    g.check(proj == "srht",
+            "the writer's DEFAULT projection is seed-only (srht)",
+            f"manifest says projection={proj!r}; nothing was passed to "
+            f"KBWriter.create")
     g.check(not rot_entries,
-            "a --projection srht .kbi ships NO binarizer/rotations.* entry",
+            "a DEFAULT-built .kbi ships NO binarizer/rotations.* entry",
             f"rotation entries present: {rot_entries}" if rot_entries
             else "none — the projection regenerates from (dim, k, seed, "
                  "srht_rounds) on both sides")
@@ -257,7 +271,8 @@ def defaults_parity(g: Gate) -> None:
     js = run_js(kbi, kbc, queries)
 
     g.check(js["has_rotation_entry"] is False,
-            "js/kb-reader.js opens the sidecar-free srht .kbi and searches it",
+            "js/kb-reader.js opens the sidecar-free DEFAULT .kbi and searches "
+            "it",
             f"live_count={js['live_count']} "
             f"hits per query={[len(q['hits']) for q in js['queries']]}")
     g.check(all(len(q["hits"]) > 0 for q in js["queries"])
@@ -685,15 +700,18 @@ def main() -> int:
     )
     g.coverage(
         "Two projections are covered across readers: haar with a float32 "
-        "sidecar (committed fixture) and srht with NO sidecar (built at "
-        "runtime). The int8-quantized sidecar and rademacher are still "
+        "sidecar (committed fixture, which pins projection='haar' explicitly "
+        "so the sidecar path survives the 2026-08 default flip) and srht with "
+        "NO sidecar (the writer's default, built at runtime). The "
+        "int8-quantized sidecar and rademacher are still "
         "unexercised end-to-end here — rademacher's plane generator is pinned "
         "bit-identically by tests/test_js_reader_compat.py, but no .kbi in "
         "either projection is read by both readers. remex is out of scope by "
         "construction: js/kb-reader.js refuses it (see gate_open_validation)."
     )
     g.coverage(
-        "The srht fixture is REBUILT by the writer on every run rather than "
+        "The default/srht fixture is REBUILT by the writer on every run rather "
+        "than "
         "committed. That is what makes it cheap, and it means a writer "
         "regression moves both readers' input together and stays invisible "
         "here: this arm asserts the two READERS agree about an artifact, never "

@@ -180,14 +180,24 @@ Writes `knowledge.kbi` (hot index) plus a sibling `knowledge.kbc/`
 Binarizer knobs (v2, remax codec; `sync` accepts the same set when it
 creates the index):
 
+The default projection is `srht`: the planes regenerate from
+`(dim, k, seed, srht_rounds)` on both sides, so a v2 `.kbi` ships **no
+rotation sidecar at all** and any conforming reader — including
+`js/kb-reader.js` — reproduces them bit-for-bit.
+
 ```bash
-# structured projections — planes regenerate from (dim, k, seed) on both
-# sides, so the .kbi ships no rotation sidecar at all
-remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection rademacher
+# the default, spelled out
 remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection srht --srht-rounds 3
 
-# Haar (the default) ships the sidecar; int8 shrinks it ~4x
-remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --rotations-quant int8
+# the other seed-only family; also ships nothing
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection rademacher
+
+# Haar: marginally higher recall, but the .kbi must carry the rotation
+# matrices (up to 9 MiB) because non-numpy readers cannot re-derive them.
+# int8 shrinks that sidecar ~4x.
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection haar
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection haar \
+    --rotations-quant int8
 
 # bake a default dense-similarity floor into the manifest as
 # retrieval.min_sim; any query-time --min-sim overrides it

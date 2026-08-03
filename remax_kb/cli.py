@@ -409,10 +409,12 @@ def _v2_binarizer_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--projection",
         choices=("haar", "rademacher", "srht"),
-        default="haar",
-        help="(v2, remax codec only) hyperplane family. 'haar' (default) ships "
-        "a rotation sidecar; 'rademacher' and 'srht' regenerate planes from "
-        "(dim, k, seed) on both sides and ship nothing, so the .kbi is smaller.",
+        default="srht",
+        help="(v2, remax codec only) hyperplane family. 'srht' (default) and "
+        "'rademacher' regenerate planes from (dim, k, seed) on both sides and "
+        "ship NOTHING, so the .kbi is smaller and any reader can reproduce "
+        "them; 'haar' has marginally higher recall but ships a rotation "
+        "sidecar (up to 9 MiB) that non-numpy readers cannot do without.",
     )
     p.add_argument(
         "--srht-rounds",
@@ -426,7 +428,8 @@ def _v2_binarizer_args(p: argparse.ArgumentParser) -> None:
         choices=("float32", "int8"),
         default="float32",
         help="(v2, --projection haar only) how the rotation sidecar is stored. "
-        "'int8' shrinks it ~4x; ignored for rademacher/srht, which ship none.",
+        "'int8' shrinks it ~4x; ignored for the default srht and for "
+        "rademacher, which ship none.",
     )
     p.add_argument(
         "--min-sim",

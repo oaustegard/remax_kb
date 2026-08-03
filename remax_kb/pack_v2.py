@@ -103,7 +103,18 @@ class KBWriter:
         chunks_uri: str | None = None,
         source: str = "",
         rotations_quant: str = "float32",
-        projection: str = "haar",
+        # DEFAULT: 'srht'. Seed-only, so a v2 .kbi ships no
+        # `binarizer/rotations.*` sidecar at all and any conforming reader
+        # regenerates the planes from (dim, k, seed, srht_rounds). 'haar' has
+        # marginally better recall (srht recovers ~85% of the Rademacher->Haar
+        # gap, so it sits slightly BELOW haar, within noise) but is
+        # numpy-only: its planes come from PCG64 + Ziggurat + LAPACK QR, which
+        # a JavaScript reader cannot reproduce, and a mismatched projection is
+        # not an approximation — it flips ~50% of code bits. Existing artifacts
+        # are unaffected: `binarizer.projection` is recorded in the manifest
+        # and readers dispatch on it, so this changes only what NEW packs
+        # produce. Pass projection="haar" to keep the old behaviour.
+        projection: str = "srht",
         srht_rounds: int = 3,
         codec: str = "remax",
         bits: int = 4,

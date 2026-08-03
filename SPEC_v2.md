@@ -146,10 +146,26 @@ clients to detect updates without re-parsing the body.
 `"remex-lloyd-max"` (optional multi-bit; see §remex codec below). A reader MUST
 refuse unknown kinds.
 
-`binarizer.projection` — `"haar"` (default) or `"rademacher"`. Selects the
-hyperplane family and, decisively, whether the rotation is *shipped* or
-*regenerated* — see §projection below. With `"rademacher"` the `.kbi` carries no
-rotation entry and `rotations_quant` is `"none"`. Not present for the remex codec.
+`binarizer.projection` — `"srht"` (default), `"haar"`, or `"rademacher"`.
+Selects the hyperplane family and, decisively, whether the rotation is
+*shipped* or *regenerated* — see §projection below. With `"srht"` or
+`"rademacher"` the `.kbi` carries no rotation entry and `rotations_quant` is
+`"none"`. Not present for the remex codec.
+
+The field is always written explicitly, so **the default binds writers, never
+readers**: an artifact packed before the default moved carries
+`"projection": "haar"` and is decoded exactly as it always was. There is no
+version of this format in which a reader guesses the projection.
+
+The default was `"haar"` until 2026-08. It moved because the shipped-rotation
+requirement is asymmetric — a numpy reader ignores the sidecar and re-derives
+the planes, a JavaScript reader cannot and must be handed them — so every haar
+`.kbi` carries up to 9 MiB of planes for a consumer that may never load them,
+and the format's own worst failure mode (§Why it matters: a projection mismatch
+flips ~50% of code bits) was reachable only on the default path. `srht` gives
+that up for slightly LOWER recall — it recovers ~85% of the Rademacher→Haar gap,
+so it sits just below haar, within noise — in exchange for zero shipped bytes
+and bit-for-bit cross-language reproducibility.
 
 `binarizer.*` — identical semantics to v1, plus the optional
 `binarizer.rotations_quant` (`"float32"` default, or `"int8"`) which
@@ -381,10 +397,12 @@ them (corpus hashed with A, query with B) flips ~50% of code bits and collapses
 recall to chance. This is not the small, bounded error of int8 quantization
 (~0.24% of bits); it is total.
 
-- **`haar`** (default) — orthogonal matrices from numpy's
-  `PCG64 + Ziggurat + LAPACK-QR`. Not reproducible outside numpy (LAPACK QR even
-  drifts across platforms), so a Haar `.kbi` **MUST ship** the matrices
-  (`rotations.f32`, or int8 `rotations.i8` + scale). Highest recall.
+- **`haar`** — orthogonal matrices from numpy's `PCG64 + Ziggurat +
+  LAPACK-QR`. Not reproducible outside numpy (LAPACK QR even drifts across
+  platforms), so a Haar `.kbi` **MUST ship** the matrices (`rotations.f32`, or
+  int8 `rotations.i8` + scale). Highest recall, and the only family with a
+  per-artifact byte cost. Was the default until 2026-08; still fully supported
+  and selectable with `--projection haar`.
 
 - **`rademacher`** — ±1 hyperplane entries from `splitmix64`, a tiny integer
   PRNG every language reproduces bit-for-bit. The `.kbi` ships **nothing**; both
@@ -420,8 +438,9 @@ Python↔Node round-trip pins them bit-identical.
 
 ### `projection == "srht"` — structured-orthogonal, seed-only
 
-The preferred seed-only projection: ~Haar recall (recovers ~85% of the
-Rademacher→Haar gap) at no shipped bytes. `binarizer.srht_rounds` (default 3)
+**The default.** The preferred seed-only projection: ~Haar recall (recovers
+~85% of the Rademacher→Haar gap — i.e. slightly *below* haar, within noise) at
+no shipped bytes. `binarizer.srht_rounds` (default 3)
 sets the mixing depth. Like `rademacher` it ships **no** `binarizer/rotations.*`
 entry — the matrix is regenerated from `(dim, k, seed, srht_rounds)`.
 
