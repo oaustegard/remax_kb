@@ -27,9 +27,12 @@ jobs:
           pip install -e ".[dev,remex,api,handlers,runtime]"
       - name: Run tests
         run: pytest -q
-      - name: Reader parity gates (full report)
+      - name: Gates (full report)
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
         run: |
           python tests/gates/gate_tokenizer_parity.py
           python tests/gates/gate_cross_reader.py
+          python tests/gates/gate_topk_stability.py
       - name: Codec benchmark (smoke)
         run: python bench/bench_codecs.py --n 500 --queries 50

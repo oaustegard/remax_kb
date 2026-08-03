@@ -13,6 +13,7 @@ so the ``numpy>=1.24`` floor still works — just without the speedup.
 from __future__ import annotations
 
 import numpy as np
+from remax.packing import stable_top_k
 
 POPCOUNT_LUT = np.array(
     [bin(b).count("1") for b in range(256)], dtype=np.uint16
@@ -64,10 +65,24 @@ def hamming_scan(codes: np.ndarray, query: np.ndarray) -> np.ndarray:
 
 
 def top_k(distances: np.ndarray, k: int) -> np.ndarray:
-    """Indices of the k smallest distances, ascending. Stable ties (lower index first)."""
+    """Indices of the k smallest distances, ascending. Stable ties (lower index first).
+
+    Delegates the selection to :func:`remax.packing.stable_top_k`, which is the
+    one implementation of this algorithm that remax_kb should carry. That
+    function widens the ``argpartition`` result to ``dists <= pivot`` before the
+    stable sort, so a lower-indexed element tied at the kth distance cannot be
+    stranded outside the partition (remax PR #32). Hamming distances are
+    integer-valued over a narrow range, so ties AT the kth boundary are the
+    common case here, not a corner case: a bare ``argpartition(d, k-1)[:k]``
+    followed by a stable sort disagrees with
+    ``np.argsort(d, kind="stable")[:k]`` on essentially every realistic scan.
+
+    ``k <= 0`` returns an empty index array (remax's ``stable_top_k`` raises
+    instead); ``k`` above ``len(distances)`` is clamped.
+
+    Gated by ``tests/gates/gate_topk_stability.py``.
+    """
     k = min(int(k), distances.shape[0])
     if k <= 0:
         return np.empty(0, dtype=np.intp)
-    # np.argpartition for the cut, then sort the slice — same recipe as remax.
-    cut = np.argpartition(distances, k - 1)[:k]
-    return cut[np.argsort(distances[cut], kind="stable")]
+    return stable_top_k(distances, k)
