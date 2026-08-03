@@ -177,6 +177,23 @@ remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --embedder gemini --gemini-dim 76
 Writes `knowledge.kbi` (hot index) plus a sibling `knowledge.kbc/`
 (chunk shards) in the same directory.
 
+Binarizer knobs (v2, remax codec; `sync` accepts the same set when it
+creates the index):
+
+```bash
+# structured projections — planes regenerate from (dim, k, seed) on both
+# sides, so the .kbi ships no rotation sidecar at all
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection rademacher
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection srht --srht-rounds 3
+
+# Haar (the default) ships the sidecar; int8 shrinks it ~4x
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --rotations-quant int8
+
+# bake a default dense-similarity floor into the manifest as
+# retrieval.min_sim; any query-time --min-sim overrides it
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --min-sim auto
+```
+
 ### Incrementally (re)build a v2 index — `sync`
 
 ```bash
@@ -364,14 +381,21 @@ remax_kb/
 │   ├── formats.py                  # v1/v2 zip-layout detection
 │   ├── handlers.py                 # md/txt/html/pdf/rst extractors
 │   ├── embedders.py                # Jina ONNX/torch + Gemini + LFM2.5 wrappers
-│   ├── cli.py                      # `remax-kb pack|query|info|migrate` CLI
+│   ├── projection.py               # rademacher / SRHT hyperplane families
+│   ├── rotations.py                # int8 quantize/dequantize for the Haar sidecar
+│   ├── cli.py                      # `remax-kb pack|sync|query|info|migrate` CLI
 │   └── _hamming.py                 # numpy popcount scan
+├── js/
+│   └── kb-reader.js                # zero-dependency browser/Node v2 reader
 ├── skill/
 │   ├── SKILL.md
 │   └── search.py
 ├── scripts/
 │   ├── pack_demo.py
-│   └── query_demo.py
+│   ├── query_demo.py
+│   └── build_q4_onnx.py
+├── bench/
+│   └── bench_codecs.py             # remax vs remex scan benchmark
 ├── examples/
 │   ├── tiny_corpus/                # ~30 chunks of public-domain text
 │   └── build_claude_docs_kb.py     # builds the docs.claude.com demo .kb
@@ -381,7 +405,14 @@ remax_kb/
     ├── test_gemini.py              # GeminiEmbedder mocked
     ├── test_gemini_live.py         # gated on GEMINI_API_KEY
     ├── test_cli.py                 # remax-kb CLI surface
-    └── test_retrieval.py           # gated on REMAX_KB_FULL + torch
+    ├── test_retrieval.py           # gated on REMAX_KB_FULL + torch
+    ├── fixtures/                   # committed jsparity .kbi/.kbc + builder
+    └── gates/                      # checks that must be shown to go red
+        ├── gate.py                 # harness: no known-bad ⇒ INCONCLUSIVE
+        ├── gate_tokenizer_parity.py    # both readers vs bm25s.tokenize
+        ├── gate_cross_reader.py        # js/kb-reader.js vs read_v2, in Node
+        ├── gate_topk_stability.py      # top-k ties vs np.argsort(stable)
+        └── gate_open_validation.py     # SPEC_v2 validation order refusals
 ```
 
 ## Validation
@@ -407,6 +438,25 @@ deps, then:
 pip install -r requirements-build.txt -r requirements-runtime.txt
 REMAX_KB_FULL=1 pytest -q
 ```
+
+### Gates
+
+`tests/gates/` holds checks whose job is to *block*, and which have each
+been shown to go red against a deliberately broken subject. They run
+under `pytest` (via `test_reader_parity.py` and
+`test_correctness_gates.py`) and again standalone in CI, where they
+print their known-bads and their stated coverage limits:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 tests/gates/gate_tokenizer_parity.py
+PYTHONDONTWRITEBYTECODE=1 python3 tests/gates/gate_cross_reader.py     # needs node
+PYTHONDONTWRITEBYTECODE=1 python3 tests/gates/gate_topk_stability.py
+PYTHONDONTWRITEBYTECODE=1 python3 tests/gates/gate_open_validation.py  # node arm optional
+```
+
+The harness (`tests/gates/gate.py`) reports INCONCLUSIVE, not PASS, for
+a gate that registers no known-bad or states no coverage limit: a check
+nobody has seen fail is indistinguishable from a check that cannot.
 
 ## Scope
 
