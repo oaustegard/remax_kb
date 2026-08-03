@@ -367,6 +367,25 @@ class KB:
             self._remex_docmat = qz.decode(comp).astype(np.float32)
         return self._remex_docmat
 
+    def encode_query_code(self, vec: np.ndarray) -> np.ndarray:
+        """Center, truncate and sign-pack a query embedding into a row code.
+
+        The Hamming-codec query encoder, factored out of :meth:`_dense_search`
+        so a cross-reader parity gate can compare it byte-for-byte with
+        ``js/kb-reader.js``'s ``encodeQueryCode()`` without re-implementing it.
+
+        Returns a ``(row_bytes,)`` uint8 array.
+        """
+        centered = np.asarray(vec, dtype=np.float32) - self._mean
+        truncated = centered[: self._dim]
+        from remax import StackedSignBitQuantizer
+        q_quant = StackedSignBitQuantizer(d=self._dim, k=self._k, seed=self._seed)
+        if self._deq_rotations is not None:
+            # int8-packed: encode the query with the same dequantized rotations
+            # the corpus was packed against (not the exact f32 recompute).
+            q_quant.rotations_ = self._deq_rotations.astype(q_quant.dtype)
+        return q_quant.encode(truncated[None, :])[0]
+
     def _dense_search(self, query: str, embedder: Embedder) -> list[Hit]:
         prompt = self._m.get("prompts", {}).get("query", "Query: ")
         # The embedder protocol takes prompt by *name* (query|document), not the literal string.
@@ -393,15 +412,7 @@ class KB:
                                 dense_dist=d, dense_sim=float(sims[row_idx])))
             return hits
 
-        centered = vec - self._mean
-        truncated = centered[: self._dim]
-        from remax import StackedSignBitQuantizer
-        q_quant = StackedSignBitQuantizer(d=self._dim, k=self._k, seed=self._seed)
-        if self._deq_rotations is not None:
-            # int8-packed: encode the query with the same dequantized rotations
-            # the corpus was packed against (not the exact f32 recompute).
-            q_quant.rotations_ = self._deq_rotations.astype(q_quant.dtype)
-        q_code = q_quant.encode(truncated[None, :])[0]  # (row_bytes,) uint8
+        q_code = self.encode_query_code(vec)
 
         # Hamming scan, skipping tombstones
         # XOR rows, sum popcount per row
@@ -427,9 +438,7 @@ class KB:
         return hits
 
     def _bm25_search(self, query: str) -> list[Hit]:
-        # bm25s.get_scores expects list of raw string tokens
-        import re
-        q_tokens = re.findall(r"[a-z0-9]+", query.lower())
+        q_tokens = tokenize_query(query)
         if not q_tokens:
             return []
         scores = self._bm25.get_scores(q_tokens)
@@ -509,6 +518,32 @@ class KB:
 # ─────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────
+
+def tokenize_query(query: str) -> list[str]:
+    """Tokenize a query with the *writer's own* tokenizer.
+
+    ``pack_v2.KBWriter._build_bm25`` indexes with
+    ``bm25s.tokenize(live_texts, stopwords=None)``, whose default
+    ``token_pattern`` is scikit-learn's ``(?u)\\b\\w\\w+\\b`` — Unicode ``\\w``
+    includes ``_`` and non-ASCII letters, so ``response_model``, ``get_user``
+    and ``café`` are each ONE vocabulary entry.
+
+    This reader used to tokenize the query with ``re.findall(r"[a-z0-9]+",
+    ...)``, which splits exactly those tokens apart. Every resulting fragment
+    misses the vocabulary, the whole query scores 0 on the lexical arm, and
+    hybrid RRF silently degrades to dense-only — on identifier-shaped queries,
+    which is most of what a developer-docs KB is asked.
+
+    Calling ``bm25s.tokenize`` (a hard runtime dependency, already imported for
+    the retriever) rather than restating its pattern keeps writer and reader on
+    one implementation, so a future upstream change to the default pattern
+    moves both together.
+    """
+    toks = bm25s.tokenize(
+        query, stopwords=None, return_ids=False, show_progress=False
+    )
+    return list(toks[0]) if toks else []
+
 
 def _load_bm25_from_zip(zf: zipfile.ZipFile) -> bm25s.BM25:
     """Load bm25s.BM25 from a zip subdir by extracting to a tempdir."""

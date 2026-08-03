@@ -1,10 +1,18 @@
 """Verify the JS reader's bit-pack convention matches remax.
 
-The JS reader can't be run from pytest, so this test executes the
-same arithmetic in Python and asserts it equals what `remax.encode()`
-produces. If this test passes, the JS reader will produce bit-identical
-codes for the same input — assuming the JS implementation follows the
-Python logic faithfully (it does, by construction).
+These tests execute the JS reader's arithmetic *re-implemented in Python* and
+assert it equals what `remax.encode()` produces. That covers the convention
+(bit order, stack order, dequant layout) across many (d, k, seed) settings —
+but it cannot catch a divergence between the Python transcription and the
+actual JavaScript, because a transcription is not evidence about its original.
+The old claim here — "the JS implementation follows the Python logic
+faithfully (it does, by construction)" — was exactly the assumption under test.
+
+The JS reader IS executed now: `tests/gates/gate_cross_reader.py` runs
+`js/kb-reader.js` in Node over a committed fixture and asserts byte-identical
+query codes and matching top-k against `remax_kb.read_v2`. It covers one
+configuration deeply; these tests cover many configurations shallowly. Keep
+both.
 """
 import numpy as np
 import pytest

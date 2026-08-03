@@ -360,10 +360,21 @@ function bm25Scores(queryTokens, bm25) {
   return scores;
 }
 
-function tokenizeQuery(text) {
-  // Matches the writer's bm25s.tokenize default tokenization (lowercase
-  // + alphanumeric runs).
-  return text.toLowerCase().match(/[a-z0-9]+/g) || [];
+// The writer indexes with `bm25s.tokenize(texts, stopwords=None)`, whose
+// default `token_pattern` is scikit-learn's `(?u)\b\w\w+\b`: maximal runs of
+// two or more Unicode word characters, lowercased. Python's `\w` covers
+// `[\p{L}\p{N}_]`; JS `\w` is ASCII-only and would split `response_model`,
+// `get_user` and `café` — all of which the writer keeps whole — into
+// fragments that miss the vocabulary and score exactly zero.
+//
+// This is the ONLY place the pattern is spelled out: the Python reader calls
+// bm25s.tokenize directly rather than restating it. Parity between this regex
+// and bm25s's actual behaviour is asserted by running bm25s itself, in
+// tests/gates/gate_tokenizer_parity.py.
+const QUERY_TOKEN_RE = /[\p{L}\p{N}_]{2,}/gu;
+
+export function tokenizeQuery(text) {
+  return text.toLowerCase().match(QUERY_TOKEN_RE) || [];
 }
 
 // ─────────────────────────────────────────────────────────────────────────

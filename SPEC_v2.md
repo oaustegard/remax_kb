@@ -169,6 +169,18 @@ these at query time.
 `lexical.tokenizer` — `"bm25s.default"` for now. Future kinds may
 encode the tokenizer identifier here.
 
+`"bm25s.default"` is `bm25s.tokenize`'s default `token_pattern` —
+scikit-learn's `(?u)\b\w\w+\b`, applied after lowercasing: maximal runs
+of **two or more Unicode word characters**, a word character being
+`[\p{L}\p{N}_]`. Readers MUST tokenize the *query* the same way, or
+in-vocabulary terms become unreachable: `response_model`, `get_user`
+and `café` are each ONE token, and an ASCII-alphanumeric split of the
+query scores them zero against an index that holds them whole. A Python
+reader should call `bm25s.tokenize` rather than restate the pattern;
+`js/kb-reader.js` spells it `/[\p{L}\p{N}_]{2,}/gu` because JavaScript's
+`\w` is ASCII-only. Parity is asserted against bm25s itself in
+`tests/gates/gate_tokenizer_parity.py`.
+
 `lexical.stopwords` — `null` or an array of strings. Defaults to no
 stopword removal (matches the bm25 skill convention).
 

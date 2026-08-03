@@ -1,0 +1,9 @@
+{"sha256":"6a2dcba95f476cd9605db7a3481a620ad34cc2c0d1d602bdf446ed9fa726a02c","meta":{"source":"doc-fastapi"}}
+Use response_model to declare the shape of the response. FastAPI will filter the returned data to the declared response_model.{"sha256":"e4e4bc5f35e066a1c28e6ac84de560b2652f9bc372c0891ca550267d38f5f22c","meta":{"source":"doc-fastapi"}}
+def get_user(user_id: int): the path parameter item_id is declared in the path and passed to the function.{"sha256":"5491355f98fe42ab6a33d93bc9a1ba342c72352726c485102bdc5ca626c49296","meta":{"source":"doc-fastapi"}}
+Raise HTTPException with a status_code of 404 when the item is not found.{"sha256":"26d7e3a2bd0b7b00bf039b4734d6a7bf60bf6083104987bc631a2b97dd0871e1","meta":{"source":"doc-unicode"}}
+Un café serveur naïve résumé: Unicode identifiers survive tokenization intact when the pattern is Unicode aware.{"sha256":"e57b9539af4f0fcde14f75e68ba84a8e27a7a23a97022ddb875ff397fa153267","meta":{"source":"doc-hamming"}}
+Hamming distance counts mismatched bits between two packed binary codes.{"sha256":"a568c7aa76d1ea1c5185f0da682d4e5abeacf4253a99494e5d701a276038196b","meta":{"source":"doc-bm25"}}
+BM25 ranks documents by length normalized term frequency and inverse document frequency.{"sha256":"6f421aab22869892ee41b7ce1b310913eca916284541d986da11bdc6919eac9d","meta":{"source":"doc-simhash"}}
+Centered SimHash projects vectors onto random planes and keeps only the sign of each projection.{"sha256":"3a7f3c17722466c1360b61a83379297661efe2b325038a75b7530e91fd568c90","meta":{"source":"doc-retired"}}
+This chunk is deleted before commit so the fixture carries a tombstone row and exercises the live row mapping.
