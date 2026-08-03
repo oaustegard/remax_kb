@@ -74,7 +74,9 @@ python skill/search.py --kb <path_to_kb_or_kbi> --query "<user question>" --k 10
   toward rank-1.
 
 A per-corpus default floor can be baked into the `.kbi` manifest under
-`retrieval.min_sim`; an explicit `--min-sim` always overrides it.
+`retrieval.min_sim` — write it with `remax-kb pack --v2 --min-sim ...`
+(or `remax-kb sync --min-sim ...`); an explicit `--min-sim` at query
+time always overrides it.
 
 On first invocation per session the script downloads the ONNX
 embedder asset (`model.onnx`, ~847 MB) from the URL recorded in the

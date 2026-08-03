@@ -108,6 +108,10 @@ def _cmd_pack_v2(args: argparse.Namespace) -> int:
         codec=args.codec,
         bits=args.bits,
         source=args.source,
+        projection=args.projection,
+        srht_rounds=args.srht_rounds,
+        rotations_quant=args.rotations_quant,
+        min_sim=args.min_sim,
     )
     writer.add_chunks(chunks)
     writer.commit()
@@ -140,7 +144,11 @@ def _cmd_sync(args: argparse.Namespace) -> int:
 
     embedder = _build_embedder(args.embedder, args)
     if out_path.exists():
-        writer = KBWriter.open(name=name, output_dir=output_dir, embedder=embedder)
+        # Projection/quantization come back from the existing manifest — they
+        # describe the bits already on disk and cannot be changed by a sync.
+        # min_sim is a policy knob, so an explicit --min-sim still applies.
+        writer = KBWriter.open(name=name, output_dir=output_dir,
+                               embedder=embedder, min_sim=args.min_sim)
     else:
         writer = KBWriter.create(
             name=name,
@@ -150,6 +158,10 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             k=args.k,
             seed=args.seed,
             source=args.source,
+            projection=args.projection,
+            srht_rounds=args.srht_rounds,
+            rotations_quant=args.rotations_quant,
+            min_sim=args.min_sim,
         )
 
     stats = writer.sync(chunks)
@@ -389,6 +401,44 @@ def _embedder_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _v2_binarizer_args(p: argparse.ArgumentParser) -> None:
+    """v2 writer knobs that KBWriter has always supported but the CLI could not
+    reach — so `srht` and `rademacher`, shipped as v0.4.0 headline features
+    with normative spec text and a JS implementation, were unreachable from
+    `remax-kb pack`."""
+    p.add_argument(
+        "--projection",
+        choices=("haar", "rademacher", "srht"),
+        default="haar",
+        help="(v2, remax codec only) hyperplane family. 'haar' (default) ships "
+        "a rotation sidecar; 'rademacher' and 'srht' regenerate planes from "
+        "(dim, k, seed) on both sides and ship nothing, so the .kbi is smaller.",
+    )
+    p.add_argument(
+        "--srht-rounds",
+        type=int,
+        default=3,
+        help="(v2, --projection srht only) number of randomized Hadamard "
+        "rounds (default 3)",
+    )
+    p.add_argument(
+        "--rotations-quant",
+        choices=("float32", "int8"),
+        default="float32",
+        help="(v2, --projection haar only) how the rotation sidecar is stored. "
+        "'int8' shrinks it ~4x; ignored for rademacher/srht, which ship none.",
+    )
+    p.add_argument(
+        "--min-sim",
+        type=_min_sim_arg,
+        default=None,
+        help="(v2 only) default dense-similarity floor recorded in the "
+        "manifest as retrieval.min_sim: 'auto', 'off', or a float in [0, 1]. "
+        "Readers use it when a query does not pass its own --min-sim. Omit to "
+        "write no retrieval block at all.",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="remax-kb", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -407,6 +457,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="bits/coord for --codec remex (1..8, default 4)")
     pack_p.add_argument("--source", default="", help="free-text source description")
     pack_p.add_argument("--batch-size", type=int, default=16, help="(v1 only) embed batch size")
+    _v2_binarizer_args(pack_p)
     _embedder_args(pack_p)
     pack_p.set_defaults(func=_cmd_pack)
 
@@ -427,6 +478,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sync_p.add_argument(
         "--no-compact", action="store_true", help="never auto-compact, regardless of ratio",
     )
+    _v2_binarizer_args(sync_p)
     _embedder_args(sync_p)
     sync_p.set_defaults(func=_cmd_sync)
 
