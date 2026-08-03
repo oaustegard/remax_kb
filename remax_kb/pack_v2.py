@@ -761,6 +761,16 @@ class KBWriter:
         total = manifest["chunks"]["total_rows"]
         vectors = vectors.reshape(total, row_bytes)
         # Preserve projection + quantization across mutation re-commits.
+        #
+        # The "haar" fallback is DELIBERATE and must NOT be tracked to the
+        # constructor default. It is not a default, it is a decoding fact: an
+        # artifact whose manifest omits `projection` was written when haar was
+        # the default, and its corpus codes are packed against Haar planes.
+        # Re-committing it as srht would re-pack new rows in a statistically
+        # independent sign-space from the existing ones -- ~50% of bits flipped
+        # between old and new rows in one index, with no error anywhere. Every
+        # writer since 2026-08 emits the field explicitly, so this branch only
+        # ever sees pre-flip artifacts.
         self._projection = bq.get("projection", "haar")
         self._srht_rounds = bq.get("srht_rounds", 3)
         self._rotations_quant = bq.get("rotations_quant", "none" if self._codec == "remex" else "float32")
