@@ -46,10 +46,10 @@ api = [
 # Optional multi-bit remex codec (rotation + Lloyd-Max scalar quant).
 # numpy+scipy only — scipy is already a core dep, so this is light.
 remex = [
-    "remex @ git+https://github.com/oaustegard/remex.git",
+    "remex @ git+https://github.com/oaustegard/remex.git@v0.6.0",
 ]
 dev = ["pytest>=7.0", "beautifulsoup4>=4.11", "pypdf>=4.0", "httpx>=0.25",
-       "remex @ git+https://github.com/oaustegard/remex.git"]
+       "remex @ git+https://github.com/oaustegard/remex.git@v0.6.0"]
 
 [project.scripts]
 remax-kb = "remax_kb.cli:main"
