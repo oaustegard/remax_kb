@@ -3,7 +3,7 @@
 numpy>=1.24
 remax @ git+https://github.com/oaustegard/remax.git@v0.2.0
 # remex codec (optional --codec remex). numpy+scipy only.
-remex @ git+https://github.com/oaustegard/remex.git
+remex @ git+https://github.com/oaustegard/remex.git@v0.6.0
 torch
 transformers
 sentence-transformers
