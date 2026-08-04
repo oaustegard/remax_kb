@@ -8,4 +8,4 @@ tokenizers>=0.15
 remax @ git+https://github.com/oaustegard/remax.git@v0.2.0
 # Needed only to read remex-codec .kb files (binarizer.kind == remex-lloyd-max).
 # numpy+scipy only; scipy is already listed above.
-remex @ git+https://github.com/oaustegard/remex.git
+remex @ git+https://github.com/oaustegard/remex.git@v0.6.0
