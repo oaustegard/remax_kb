@@ -180,14 +180,24 @@ Writes `knowledge.kbi` (hot index) plus a sibling `knowledge.kbc/`
 Binarizer knobs (v2, remax codec; `sync` accepts the same set when it
 creates the index):
 
+The default projection is `srht`: the planes regenerate from
+`(dim, k, seed, srht_rounds)` on both sides, so a v2 `.kbi` ships **no
+rotation sidecar at all** and any conforming reader — including
+`js/kb-reader.js` — reproduces them bit-for-bit.
+
 ```bash
-# structured projections — planes regenerate from (dim, k, seed) on both
-# sides, so the .kbi ships no rotation sidecar at all
-remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection rademacher
+# the default, spelled out
 remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection srht --srht-rounds 3
 
-# Haar (the default) ships the sidecar; int8 shrinks it ~4x
-remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --rotations-quant int8
+# the other seed-only family; also ships nothing
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection rademacher
+
+# Haar: marginally higher recall, but the .kbi must carry the rotation
+# matrices (up to 9 MiB) because non-numpy readers cannot re-derive them.
+# int8 shrinks that sidecar ~4x.
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection haar
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --projection haar \
+    --rotations-quant int8
 
 # bake a default dense-similarity floor into the manifest as
 # retrieval.min_sim; any query-time --min-sim overrides it
@@ -412,7 +422,10 @@ remax_kb/
         ├── gate_tokenizer_parity.py    # both readers vs bm25s.tokenize
         ├── gate_cross_reader.py        # js/kb-reader.js vs read_v2, in Node
         ├── gate_topk_stability.py      # top-k ties vs np.argsort(stable)
-        └── gate_open_validation.py     # SPEC_v2 validation order refusals
+        ├── gate_open_validation.py     # SPEC_v2 validation order refusals
+        ├── js_cross_reader.mjs         # node harness: search + fetch
+        ├── js_open_validation.mjs      # node harness: does open() refuse?
+        └── js_encode_probe.mjs         # node harness: encodeQueryCode only
 ```
 
 ## Validation
@@ -457,6 +470,21 @@ PYTHONDONTWRITEBYTECODE=1 python3 tests/gates/gate_open_validation.py  # node ar
 The harness (`tests/gates/gate.py`) reports INCONCLUSIVE, not PASS, for
 a gate that registers no known-bad or states no coverage limit: a check
 nobody has seen fail is indistinguishable from a check that cannot.
+
+The two node-backed gates hold `js/kb-reader.js` to the Python reader on
+three claims, each with a known-bad built by *mutating the JS reader
+itself* and confirming the gate goes red:
+
+| Claim | Gate |
+|---|---|
+| identical query codes, top-k, scores and chunk bytes — at the readers' **defaults**, with no knob pinned | `gate_cross_reader.py` |
+| identical `over_fetch` / `rrf_c` / `min_sim` resolution, including the manifest's `retrieval.min_sim` and its `'auto'` derivation | `gate_cross_reader.py` |
+| the same 11 corrupted artifacts refused, SPEC_v2 validation steps 1–7 | `gate_open_validation.py` |
+
+`gate_cross_reader.py` also builds a `--projection srht` `.kbi` at
+runtime and reads it in both readers **with no rotation sidecar
+shipped** — the seed-only path that lets a browser-targeted `.kbi` skip
+the multi-megabyte Haar planes.
 
 ## Scope
 

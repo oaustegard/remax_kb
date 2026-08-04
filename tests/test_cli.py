@@ -319,9 +319,13 @@ def test_cli_pack_v2_rotations_quant_flag(stub_embedder, corpus_dir: Path,
     import zipfile
 
     out = tmp_path / "i8.kbi"
+    # --projection haar is explicit: rotations_quant only means anything for
+    # the projection that HAS a sidecar, and haar stopped being the default in
+    # 2026-08. Omitting it here used to pass by accident.
     rc = stub_embedder.main(
         ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
-         "--dim", "32", "--k", "4", "--seed", "0", "--rotations-quant", "int8"]
+         "--dim", "32", "--k", "4", "--seed", "0",
+         "--projection", "haar", "--rotations-quant", "int8"]
     )
     assert rc == 0
     capsys.readouterr()
@@ -330,6 +334,34 @@ def test_cli_pack_v2_rotations_quant_flag(stub_embedder, corpus_dir: Path,
         names = set(zf.namelist())
     assert "binarizer/rotations.i8" in names
     assert "binarizer/rotations.scale.f32" in names
+
+
+def test_cli_pack_v2_default_projection_ships_no_sidecar(
+        stub_embedder, corpus_dir: Path, tmp_path: Path, capsys):
+    """The DEFAULT pack must be seed-only.
+
+    `--projection` defaults to srht, so a plain `remax-kb pack --v2` produces a
+    .kbi with no `binarizer/rotations.*` entry at all — the property that makes
+    it readable by js/kb-reader.js, which cannot re-derive Haar planes and has
+    to be handed them. This asserts the default itself, not a flag: pass
+    nothing and the sidecar must not be there.
+    """
+    import zipfile
+
+    out = tmp_path / "default.kbi"
+    rc = stub_embedder.main(
+        ["pack", str(corpus_dir), "-o", str(out), "--v2", "--embedder", "stub",
+         "--dim", "32", "--k", "4", "--seed", "0"]
+    )
+    assert rc == 0
+    capsys.readouterr()
+    b = _v2_manifest(out)["binarizer"]
+    assert b["projection"] == "srht"
+    assert b["rotations_quant"] == "none"
+    assert b["srht_rounds"] == 3
+    with zipfile.ZipFile(out) as zf:
+        rot = [n for n in zf.namelist() if n.startswith("binarizer/rotations")]
+    assert rot == [], f"default pack shipped a rotation sidecar: {rot}"
 
 
 def test_cli_pack_v2_projections_are_queryable(stub_embedder, corpus_dir: Path,

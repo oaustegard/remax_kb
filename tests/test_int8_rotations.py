@@ -60,8 +60,14 @@ def _corpus():
 
 
 def _build(tmp: Path, quant: str, dim=64, k=4):
+    # projection="haar" is explicit and load-bearing: this whole module is
+    # about the Haar rotation SIDECAR, and haar stopped being the writer's
+    # default in 2026-08 (srht ships no sidecar, so rotations_quant is moot
+    # there). These tests used to rely on the default and would otherwise be
+    # silently testing an artifact with no rotations at all.
     w = KBWriter.create(name=f"kb_{quant}", output_dir=tmp, embedder=DeterministicEmbedder(),
-                        dim=dim, k=k, seed=0, rotations_quant=quant)
+                        dim=dim, k=k, seed=0, projection="haar",
+                        rotations_quant=quant)
     w.add_chunks(_corpus())
     w.commit()
     return tmp / f"kb_{quant}.kbi"
@@ -93,7 +99,15 @@ def test_int8_kbi_structure():
             assert len(zf.read("binarizer/rotations.scale.f32")) == 4 * 64 * 4
 
 
-def test_f32_kbi_default_unchanged():
+def test_f32_kbi_ships_the_sidecar():
+    """haar + rotations_quant='float32' ships rotations.f32 and nothing else.
+
+    Renamed from test_f32_kbi_default_unchanged: 'float32' is still the default
+    rotations_quant, but haar is no longer the default PROJECTION, so the name
+    claimed something about defaults that this test no longer exercises. The
+    default-projection claim lives in
+    test_cli.py::test_cli_pack_v2_default_projection_ships_no_sidecar.
+    """
     with tempfile.TemporaryDirectory() as d:
         kbi = _build(Path(d), "float32")
         with zipfile.ZipFile(kbi) as zf:

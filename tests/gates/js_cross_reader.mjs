@@ -7,19 +7,23 @@
 // divergence between the two languages — the one thing the format promises.
 //
 //   node js_cross_reader.mjs --kbi <path.kbi> --kbc <dir> --queries <q.json> \
-//        [--k 5] [--over-fetch 20]
+//        [--k 5] [--over-fetch N] [--rrf-c N] [--min-sim auto|off|<float>] \
+//        [--reader <kb-reader.js>]
 //
-// Nothing here re-implements reader logic: it imports KBReader, encodeQueryCode
-// and tokenizeQuery from js/kb-reader.js and only marshals I/O.
+// --over-fetch / --rrf-c / --min-sim are OMITTED by default, so the reader's
+// own defaults apply and the gate can compare them against Python's instead of
+// pinning both sides to a value neither reader would have chosen.
+//
+// Nothing here re-implements reader logic: it imports KBReader, encodeQueryCode,
+// tokenizeQuery, defaultOverFetch and RRF_C_DEFAULT from js/kb-reader.js and
+// only marshals I/O. In particular the reported knob values come from the
+// reader's own exports, not from a copy of its expressions.
 
 import { readFile, open } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, resolve } from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const { KBReader, encodeQueryCode, tokenizeQuery } = await import(
-  pathToFileURL(resolve(HERE, "../../js/kb-reader.js")).href
-);
 
 function arg(name, dflt) {
   const i = process.argv.indexOf(`--${name}`);
@@ -30,11 +34,23 @@ function arg(name, dflt) {
   return process.argv[i + 1];
 }
 
+const readerPath = resolve(arg("reader", resolve(HERE, "../../js/kb-reader.js")));
+const { KBReader, encodeQueryCode, tokenizeQuery, defaultOverFetch,
+        RRF_C_DEFAULT } = await import(pathToFileURL(readerPath).href);
+
 const kbiPath = resolve(arg("kbi"));
 const kbcDir = resolve(arg("kbc"));
 const queriesPath = resolve(arg("queries"));
 const topK = Number(arg("k", "5"));
-const overFetch = Number(arg("over-fetch", "20"));
+
+// null everywhere means "not supplied", i.e. let the reader default apply.
+const rawOverFetch = arg("over-fetch", null);
+const overFetch = rawOverFetch === null ? null : Number(rawOverFetch);
+const rawRrfC = arg("rrf-c", null);
+const rrfC = rawRrfC === null ? RRF_C_DEFAULT : Number(rawRrfC);
+const rawMinSim = arg("min-sim", null);
+const minSim = rawMinSim === null ? null
+  : (Number.isNaN(Number(rawMinSim)) ? rawMinSim : Number(rawMinSim));
 
 // A file:// fetch with Range support, so fetchChunks() exercises the real
 // chunk_map offsets instead of being stubbed out.
@@ -67,6 +83,13 @@ const out = {
   live_count: reader.liveCount,
   total_rows: reader._totalRows,
   row_bytes: reader._rowBytes,
+  // Knob values as the READER resolves them, for default-parity checks.
+  default_over_fetch: defaultOverFetch(topK),
+  rrf_c_default: RRF_C_DEFAULT,
+  resolved_min_sim: reader.resolveMinSim(minSim),
+  has_rotation_entry: reader._zipNames
+    ? reader._zipNames.some((n) => n.startsWith("binarizer/rotations"))
+    : null,
   queries: [],
 };
 
@@ -76,7 +99,7 @@ for (const q of spec.queries) {
     qvec, reader._mean, reader._rotations, reader._dim, reader._k
   );
   const hits = await reader.searchAndFetch(
-    q.text, qvec, { k: topK, alpha: null, overFetch }, fileFetch
+    q.text, qvec, { k: topK, alpha: null, overFetch, rrfC, minSim }, fileFetch
   );
   out.queries.push({
     text: q.text,

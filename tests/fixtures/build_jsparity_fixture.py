@@ -113,9 +113,17 @@ def build() -> None:
     FIXTURE_DIR.mkdir(parents=True)
 
     embedder = DeterministicEmbedder()
+    # projection="haar" is PINNED, not inherited. haar stopped being the
+    # writer's default in 2026-08 (srht ships no sidecar), and this fixture
+    # exists precisely to keep the shipped-rotation path under test: the
+    # cross-reader gate reads binarizer/rotations.f32 out of it to measure the
+    # sign margin, and the open-validation gate strips the sidecar to check the
+    # JS reader's refusal. Rebuilding it without this argument would silently
+    # delete both. The seed-only path is covered by the srht fixture
+    # gate_cross_reader builds at runtime.
     writer = KBWriter.create(
         name=NAME, output_dir=FIXTURE_DIR, embedder=embedder,
-        dim=DIM, k=K, seed=SEED,
+        dim=DIM, k=K, seed=SEED, projection="haar",
     )
     writer.add_chunks([
         Chunk(id=cid, text=text, meta={"source": cid.split("#")[0]})

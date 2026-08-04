@@ -146,10 +146,26 @@ clients to detect updates without re-parsing the body.
 `"remex-lloyd-max"` (optional multi-bit; see §remex codec below). A reader MUST
 refuse unknown kinds.
 
-`binarizer.projection` — `"haar"` (default) or `"rademacher"`. Selects the
-hyperplane family and, decisively, whether the rotation is *shipped* or
-*regenerated* — see §projection below. With `"rademacher"` the `.kbi` carries no
-rotation entry and `rotations_quant` is `"none"`. Not present for the remex codec.
+`binarizer.projection` — `"srht"` (default), `"haar"`, or `"rademacher"`.
+Selects the hyperplane family and, decisively, whether the rotation is
+*shipped* or *regenerated* — see §projection below. With `"srht"` or
+`"rademacher"` the `.kbi` carries no rotation entry and `rotations_quant` is
+`"none"`. Not present for the remex codec.
+
+The field is always written explicitly, so **the default binds writers, never
+readers**: an artifact packed before the default moved carries
+`"projection": "haar"` and is decoded exactly as it always was. There is no
+version of this format in which a reader guesses the projection.
+
+The default was `"haar"` until 2026-08. It moved because the shipped-rotation
+requirement is asymmetric — a numpy reader ignores the sidecar and re-derives
+the planes, a JavaScript reader cannot and must be handed them — so every haar
+`.kbi` carries up to 9 MiB of planes for a consumer that may never load them,
+and the format's own worst failure mode (§Why it matters: a projection mismatch
+flips ~50% of code bits) was reachable only on the default path. `srht` gives
+that up for slightly LOWER recall — it recovers ~85% of the Rademacher→Haar gap,
+so it sits just below haar, within noise — in exchange for zero shipped bytes
+and bit-for-bit cross-language reproducibility.
 
 `binarizer.*` — identical semantics to v1, plus the optional
 `binarizer.rotations_quant` (`"float32"` default, or `"int8"`) which
@@ -217,8 +233,11 @@ bits for the Hamming codec, cosine for remex.
 
 This is a **hint, not a decoding parameter** — it changes which results
 are returned, never how bytes are interpreted. A reader that ignores it
-entirely is conforming (`js/kb-reader.js` does), and a caller-supplied
-floor MUST take precedence over the manifest value. It is recorded in
+entirely is conforming, and a caller-supplied floor MUST take precedence
+over the manifest value. Both shipped readers honour it as of 2026-08
+(`read_v2._resolve_min_sim`, `KBReader.resolveMinSim`), with the same
+`'auto'` derivation, because "conforming" and "returns the same results"
+are different properties and the format's value rests on the second. It is recorded in
 the artifact because the packer knows the corpus, the bit budget and
 the row count, and a querying session generally does not.
 
@@ -233,6 +252,30 @@ header, where `row_bytes = dim * k // 8` for the remax codec and
 `dim * bits // 8` for the remex codec. Row `i` is the code for the chunk
 at row `i`. Tombstoned rows still have their bits — the reader skips them
 via `chunk_map.bin` flags, not by absence from the vectors file.
+
+### §sign convention
+
+For the remax codec a bit is `1` **iff the projected coordinate is strictly
+positive**: `bit = (x·Q > 0)`. Zero packs to `0`, together with the negatives.
+Writers and readers MUST use the same strict comparison — `remax.packing.
+encode_signs` is normative, and `numpy.packbits(rotated > 0)` is what produced
+every `vectors.bin` in existence.
+
+This is not a rounding detail. `>=` and `>` differ on exactly one input, `0.0`,
+and there they differ **totally**: the bit is inverted, by construction, in
+every precision and every summation order. Exact zeros are reachable, not
+exotic — a `rademacher` plane has entries in `{-1, +1}`, so any query whose
+contributions to a hyperplane cancel projects to exactly `0.0`.
+
+`js/kb-reader.js` packed on `>= 0` until 2026-08 and was wrong on precisely
+those coordinates (issue #20). Bit order within the byte is separately
+specified: big-endian, matching `numpy.packbits(..., bitorder='big')`.
+
+Distinct from this, and NOT resolved by fixing it: two readers computing
+`x·Q` with different float arithmetic (float32 BLAS vs a float64 accumulation
+loop) may land on opposite sides of zero for a coordinate that is merely
+*near* zero. That is a precision property of the projection, not a convention,
+and the format does not promise bit-identical codes across such readers.
 
 ## §remex codec
 
@@ -259,6 +302,20 @@ carries `"bits"` (1–8) and `"k": 1`, and omits `projection` /
   `round((1 − cosine) · 10000)` (ascending, ≈0 for a near-identical match),
   so RRF / hybrid fusion is unchanged.
 - **Dependency:** the reader imports `remex` only for this kind.
+- **Reader support is asymmetric, and deliberately so.** Decoding a remex row
+  needs both the Lloyd-Max centroid table and the Haar rotation, and the
+  artifact ships neither: they come out of numpy/scipy from `(dim, bits,
+  seed)` — PCG64 + Ziggurat + an explicit Householder QR, plus a
+  300-iteration Lloyd loop over the Gaussian CDF. A JavaScript reader cannot
+  reproduce either bit-for-bit, and a rotation that is merely *close* is not
+  an approximation of the right one (see §projection: mixing projections
+  "flips ~50% of code bits and collapses recall to chance"). A reader that
+  cannot decode this kind MUST refuse it **by name at open** — naming the
+  codec and a remedy — and MUST NOT fall through to the remax row width
+  `dim * k // 8`, which for some `(k, bits)` pairs coincides with
+  `dim * bits // 8` and silently Hamming-scores quantization indices.
+  `js/kb-reader.js` refuses; `remax_kb.read_v2` decodes. Pack with `--codec
+  remax --projection srht` for a browser-readable artifact.
 
 ## `chunk_map.bin`
 
@@ -340,10 +397,12 @@ them (corpus hashed with A, query with B) flips ~50% of code bits and collapses
 recall to chance. This is not the small, bounded error of int8 quantization
 (~0.24% of bits); it is total.
 
-- **`haar`** (default) — orthogonal matrices from numpy's
-  `PCG64 + Ziggurat + LAPACK-QR`. Not reproducible outside numpy (LAPACK QR even
-  drifts across platforms), so a Haar `.kbi` **MUST ship** the matrices
-  (`rotations.f32`, or int8 `rotations.i8` + scale). Highest recall.
+- **`haar`** — orthogonal matrices from numpy's `PCG64 + Ziggurat +
+  LAPACK-QR`. Not reproducible outside numpy (LAPACK QR even drifts across
+  platforms), so a Haar `.kbi` **MUST ship** the matrices (`rotations.f32`, or
+  int8 `rotations.i8` + scale). Highest recall, and the only family with a
+  per-artifact byte cost. Was the default until 2026-08; still fully supported
+  and selectable with `--projection haar`.
 
 - **`rademacher`** — ±1 hyperplane entries from `splitmix64`, a tiny integer
   PRNG every language reproduces bit-for-bit. The `.kbi` ships **nothing**; both
@@ -379,8 +438,9 @@ Python↔Node round-trip pins them bit-identical.
 
 ### `projection == "srht"` — structured-orthogonal, seed-only
 
-The preferred seed-only projection: ~Haar recall (recovers ~85% of the
-Rademacher→Haar gap) at no shipped bytes. `binarizer.srht_rounds` (default 3)
+**The default.** The preferred seed-only projection: ~Haar recall (recovers
+~85% of the Rademacher→Haar gap — i.e. slightly *below* haar, within noise) at
+no shipped bytes. `binarizer.srht_rounds` (default 3)
 sets the mixing depth. Like `rademacher` it ships **no** `binarizer/rotations.*`
 entry — the matrix is regenerated from `(dim, k, seed, srht_rounds)`.
 
@@ -411,7 +471,12 @@ Python↔Node round-trip pins the matrix and the resulting codes bit-identical.
 ## `binarizer/rotations.f32`
 
 **Optional; `haar` projection only.** Pre-computed Haar rotation matrices for
-the stacked-SimHash binarizer.
+the stacked-SimHash binarizer. Optional in the format, MANDATORY for any reader
+that cannot re-derive them — which asymmetrically means every haar `.kbi` ships
+the sidecar for the benefit of consumers that may never load it. If the
+consumer is JavaScript, prefer `srht`: it is seed-only, ships nothing, and a
+sidecar-free srht `.kbi` is round-tripped through `js/kb-reader.js` by
+`tests/gates/gate_cross_reader.py`.
 
 Layout: `k × dim × dim` float32 little-endian values, concatenated.
 Total size: `k * dim * dim * 4` bytes. Rotation `j` of the k-stack
@@ -447,7 +512,7 @@ pack time via `binarizer.rotations_quant == "int8"` (default
 `"float32"`). When present, `rotations.f32` is absent and these two
 entries replace it.
 
-The rotations feed only a sign test (`x·Q ≥ 0`), so f32 precision is
+The rotations feed only a sign test (`x·Q > 0` — see §sign convention), so f32 precision is
 unnecessary. Quantizing to int8 with a per-output-column scale shrinks
 the sidecar **4×** (`k·dim²` bytes + `k·dim·4` bytes of scale) while
 flipping a negligible fraction of code bits (~0.24% on a real
@@ -567,6 +632,9 @@ hits = kb.search(
     k=5,
     alpha=0.5,           # 0 = pure BM25, 1 = pure dense; default 0.5
     fusion="rrf",        # "rrf" | "weighted"
+    min_sim=None,        # dense floor; None = manifest retrieval.min_sim
+    over_fetch=None,     # fusion pool per modality; None = max(8k, 64)
+    rrf_c=60,            # RRF rank constant
 )
 # hits: [{"row": int, "chunk_id": str, "dense_dist": int,
 #         "bm25_score": float, "fused_score": float}, ...]
@@ -611,10 +679,12 @@ Reader MUST:
    contract.
 2. Center, truncate, encode via stacked-SimHash → query code.
 3. Hamming-scan against `vectors.bin`, skipping tombstoned rows.
-4. If BM25 present and `alpha < 1`, tokenize query, score against
+4. Apply the dense floor (see `retrieval.min_sim`) to the dense
+   candidates **before** fusion, if one is in effect.
+5. If BM25 present and `alpha < 1`, tokenize query, score against
    the bm25 index.
-5. Fuse scores via RRF or weighted sum (see fusion contract below).
-6. Return top-K with both raw scores and the fused score.
+6. Fuse scores via RRF or weighted sum (see fusion contract below).
+7. Return top-K with both raw scores and the fused score.
 
 ### `kb.fetch(hits)`
 
@@ -631,16 +701,27 @@ Reader MUST:
 
 ### Fusion contract
 
-**RRF** (default): `fused = Σ 1 / (60 + rank)` summed over each scorer
-the chunk appears in. The `60` constant is the conventional RRF
-parameter.
+**RRF** (default): `fused = Σ 1 / (C + rank)` summed over each scorer
+the chunk appears in. `C` defaults to `60`, the conventional RRF
+parameter; readers SHOULD expose it (`rrf_c` in `read_v2`, `rrfC` in
+`js/kb-reader.js`) since lowering it sharpens fusion toward rank-1.
 
 **Weighted**: `fused = alpha * dense_score + (1 - alpha) * bm25_norm`
 where `dense_score` is `1 - hamming/total_bits` and `bm25_norm` is
 min-max normalized across the top-N candidates from each scorer.
 
-Implementations SHOULD over-fetch candidates from each scorer (e.g.,
-`top_k * 4` from each) before fusion, then truncate to K.
+Implementations SHOULD over-fetch candidates from each scorer before
+fusion, then truncate to K. Both shipped readers default to
+`max(top_k * 8, 64)` per modality and expose the depth (`over_fetch` /
+`overFetch`). An earlier revision of this line suggested `top_k * 4`,
+and `js/kb-reader.js` implemented `max(4k, 20)` against Python's
+`max(8k, 64)` — so the same `.kbi` and the same query returned different
+results depending on the reader, at the defaults, which is where almost
+every caller sits. Deeper pools let fusion surface a document that ranks
+mid-list in each modality but agrees across both; that document is
+precisely what a shallow pool drops. Readers that disagree on this
+number disagree on results, so the default is now stated here rather
+than left as an example.
 
 ## Cache and freshness
 

@@ -63,3 +63,55 @@ def test_srht_rounds_preserved_on_reopen():
         _build(Path(d),rounds=2)
         w=KBWriter.open(name="kb_srht",output_dir=Path(d),embedder=DeterministicEmbedder())
         assert w._srht_rounds==2 and w._projection=="srht"
+
+
+def test_legacy_manifest_without_projection_reopens_as_haar():
+    """A v2 manifest that omits `binarizer.projection` must reopen as HAAR.
+
+    The writer's default moved to srht in 2026-08, and the temptation is to
+    track `KBWriter._open`'s fallback to the constructor default. That would be
+    a corruption, not a default: an artifact predating the field was packed
+    against Haar planes, and re-committing it under srht would append rows in a
+    statistically independent sign-space — ~50% of bits flipped between the old
+    and new rows of one index, with no error raised anywhere.
+
+    Built by stripping the field from a real haar artifact rather than by
+    hand-writing a manifest, so the rest of the artifact stays self-consistent.
+    """
+    import shutil
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        emb = DeterministicEmbedder()
+        w = KBWriter.create(name="legacy", output_dir=tmp, embedder=emb,
+                            dim=64, k=4, seed=0, projection="haar")
+        w.add_chunks(_corpus())
+        w.commit()
+        kbi = tmp / "legacy.kbi"
+
+        # Rewrite the .kbi with `projection` (and srht_rounds) removed.
+        with zipfile.ZipFile(kbi) as zf:
+            entries = {n: zf.read(n) for n in zf.namelist()}
+        m = json.loads(entries["manifest.json"])
+        assert m["binarizer"].pop("projection") == "haar"
+        m["binarizer"].pop("srht_rounds", None)
+        entries["manifest.json"] = json.dumps(m).encode()
+        with zipfile.ZipFile(kbi, "w", zipfile.ZIP_STORED) as zf:
+            for n, data in entries.items():
+                zf.writestr(n, data)
+
+        w2 = KBWriter.open(name="legacy", output_dir=tmp, embedder=emb)
+        assert w2._projection == "haar", (
+            "a manifest with no `projection` must be treated as haar, not as "
+            "whatever the current writer default happens to be")
+        assert w2._rotations_quant == "float32"
+
+        # And a re-commit puts the field back, explicitly, still haar.
+        w2.add_chunks([Chunk(id="p-999#chunk-001", text="one more row",
+                             meta={"source": "p999"})])
+        w2.commit()
+        with zipfile.ZipFile(kbi) as zf:
+            b = json.loads(zf.read("manifest.json"))["binarizer"]
+            assert b["projection"] == "haar"
+            assert "binarizer/rotations.f32" in zf.namelist()
+        shutil.rmtree(tmp / "legacy.kbc", ignore_errors=True)

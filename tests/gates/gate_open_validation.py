@@ -28,9 +28,22 @@ ANCHORS — two, both outside the Python reader:
      It is an independent implementation, and for step 7 it is the one that was
      already right — so agreement is evidence, not transcription.
 
-KNOWN-BADS: corrupted copies of the committed fixture ``jsparity.kbi``, one per
-validation step, each built by mutating the real writer's output rather than by
-hand-rolling a fake artifact.
+PARITY IS ASSERTED, NOT RECORDED. This gate used to *note* that the JS reader
+accepted four artifacts the Python reader refused (an unknown ``binarizer.kind``
+and all three malformed-``chunk_id`` cases) and call that a coverage limit. A
+recorded gap is not a gate: it reads the same whether the gap is four cases or
+eleven, and it never goes red. Both readers now implement SPEC_v2 steps 1-7 and
+the agreement is a check.
+
+KNOWN-BADS, two kinds:
+
+  * corrupted copies of the committed fixture ``jsparity.kbi``, one per
+    validation step, each built by mutating the real writer's output rather than
+    by hand-rolling a fake artifact;
+  * **mutated copies of js/kb-reader.js itself** — the validation deleted, one
+    step at a time — driven through the same corruptions to prove the parity
+    assertion can fail. A gate that only ever saw two agreeing readers has not
+    been shown to notice a disagreeing one.
 
     PYTHONDONTWRITEBYTECODE=1 python3 tests/gates/gate_open_validation.py
 """
@@ -215,6 +228,42 @@ def _bm25_rows_mismatch(e: dict[str, bytes]) -> dict[str, bytes]:
     return e
 
 
+def _as_remex(e: dict[str, bytes], bits: int) -> dict[str, bytes]:
+    """Re-badge the fixture as a well-formed ``remex-lloyd-max`` artifact.
+
+    NOT a corruption — SPEC_v2 §remex codec describes exactly this shape: a
+    ``bits`` field with ``k: 1``, no ``projection`` / ``rotations_quant``, no
+    rotation sidecar, an all-zero ``mean_vector_b64``. ``vectors.bin`` is
+    resized to the remex row width ``dim * bits // 8`` so the artifact is
+    internally consistent; its *contents* are meaningless, which does not
+    matter because the question is what the JS reader does at OPEN.
+
+    Built this way rather than with the real writer because ``remex`` is an
+    optional dependency (absent here, present in CI) — and the reader's
+    behaviour at open is decided by the manifest and the row widths alone, both
+    of which this reproduces faithfully.
+    """
+    import base64
+
+    e = dict(e)
+    e.pop("binarizer/rotations.f32", None)
+    m = json.loads(e["manifest.json"])
+    b = dict(m["binarizer"])
+    dim = b["dim"]
+    b.update(kind="remex-lloyd-max", k=1, bits=bits)
+    b.pop("projection", None)
+    b.pop("rotations_quant", None)
+    b["mean_vector_b64"] = base64.b64encode(
+        np.zeros(m["embedder"]["full_dim"], dtype="<f4").tobytes()
+    ).decode("ascii")
+    m["binarizer"] = b
+    e["manifest.json"] = json.dumps(m).encode()
+    need = m["chunks"]["total_rows"] * (dim * bits // 8)
+    v = e["vectors.bin"]
+    e["vectors.bin"] = (v * (need // len(v) + 1))[:need]
+    return e
+
+
 CORRUPTIONS: list[Corruption] = [
     ("required entry vectors.bin removed", 1, _drop_vectors),
     ("unknown spec_version", 2, _bad_spec_version),
@@ -245,16 +294,36 @@ def open_refuses(path: Path) -> tuple[bool, str]:
     return False, "opened without complaint"
 
 
-def js_open(path: Path) -> dict | None:
+def js_open(path: Path, reader: Path | None = None) -> dict | None:
     if shutil.which("node") is None:
         return None
-    r = subprocess.run(
-        ["node", str(HERE / "js_open_validation.mjs"), "--kbi", str(path)],
-        capture_output=True, text=True, timeout=120,
-    )
+    cmd = ["node", str(HERE / "js_open_validation.mjs"), "--kbi", str(path)]
+    if reader is not None:
+        cmd += ["--reader", str(reader)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(f"node harness failed: {r.stderr.strip()[:800]}")
     return json.loads(r.stdout)
+
+
+def mutated_reader(old: str, new: str) -> Path:
+    """A copy of js/kb-reader.js with one substring replaced.
+
+    The parity assertion below claims the JS reader refuses everything the
+    Python reader refuses. A known-bad for that claim has to be a JS reader
+    that DOESN'T — so it is built by deleting the validation from the real
+    source, not by hand-writing a stub. The count assert means a rename turns
+    the known-bad into a hard error instead of a silent no-op that "passes".
+    """
+    src = (ROOT / "js" / "kb-reader.js").read_text(encoding="utf-8")
+    if src.count(old) != 1:
+        raise RuntimeError(
+            f"known-bad mutation target {old!r} appears {src.count(old)} times "
+            f"in js/kb-reader.js; expected exactly 1")
+    d = Path(tempfile.mkdtemp(prefix="gate-openval-mutant-"))
+    dst = d / "kb-reader.js"
+    dst.write_text(src.replace(old, new), encoding="utf-8")
+    return dst
 
 
 def main() -> int:
@@ -334,9 +403,11 @@ def main() -> int:
 
         # ---- the corruptions --------------------------------------------- #
         js_results: dict[str, dict | None] = {}
+        bad_paths: dict[str, Path] = {}
         for label, step, mutate in CORRUPTIONS:
             path = write_kbi(mutate(pristine),
                              tmp / f"bad-{step}-{abs(hash(label))}.kbi")
+            bad_paths[label] = path
             refused, detail = open_refuses(path)
             g.known_bad(
                 f"step {step}: {label} is REFUSED at open",
@@ -376,15 +447,170 @@ def main() -> int:
                           if (js_results.get(lab) or {}).get("opened") is True]
             g.note(f"JS reader refuses {len(both)}/{len(CORRUPTIONS)} of the "
                    f"same corruptions")
-            if js_accepts:
-                g.coverage(
-                    "js/kb-reader.js ACCEPTS these corruptions that the Python "
-                    "reader refuses: " + "; ".join(js_accepts) + ". The two "
-                    "readers therefore do not agree on what is a valid "
-                    "artifact, and this gate does not close that gap — it only "
-                    "records it. Bringing the JS reader up to the full "
-                    "validation order is separate work."
+
+            # ---- the parity ASSERTION -------------------------------------- #
+            # This used to be a g.coverage() note listing four corruptions the
+            # JS reader accepted (an unknown binarizer.kind and all three
+            # malformed-chunk-id cases). A recorded gap is not a gate: it reads
+            # identically whether the gap is four cases or eleven, and it does
+            # not go red when a fifth appears. It is now a check, so the two
+            # readers are pinned to one definition of "valid artifact".
+            g.check(
+                not js_accepts and len(both) == len(CORRUPTIONS),
+                "PARITY: js/kb-reader.js refuses every corruption the Python "
+                "reader refuses (SPEC_v2 validation steps 1-7)",
+                f"{len(both)}/{len(CORRUPTIONS)} refused by both"
+                + (f"; JS still ACCEPTS: {'; '.join(js_accepts)}"
+                   if js_accepts else ""))
+
+            # ---- known-bads for the parity assertion ----------------------- #
+            # Each deletes one of the validations added to js/kb-reader.js and
+            # confirms the assertion above notices. Without these, "the readers
+            # agree" is a claim that has never been shown capable of failing.
+            #
+            # Step 6 needs its own artifact rather than the CORRUPTIONS entry:
+            # on the committed fixture, bm25/ is present, so step 7 refuses the
+            # same bytes and MASKS step 6 entirely. That is worth knowing on its
+            # own — the JS step-6 check only does any work on a dense-only .kbi,
+            # which is exactly the artifact used here.
+            dense_only_live = write_kbi(
+                {k: v for k, v in _live_count_wrong(pristine).items()
+                 if not k.startswith("bm25/")},
+                tmp / "bad-6-dense-only.kbi")
+            py_refuses_dense, py_detail = open_refuses(dense_only_live)
+            g.check(py_refuses_dense,
+                    "step 6 in isolation: a dense-only .kbi whose live_count "
+                    "disagrees with its tombstones is refused (Python)",
+                    py_detail)
+            js_dense = js_open(dense_only_live) or {}
+            g.check(js_dense.get("opened") is False,
+                    "step 6 in isolation: js/kb-reader.js refuses it too "
+                    "(nothing else can catch it without bm25/)",
+                    json.dumps(js_dense))
+
+            for kb_label, old_src, new_src, cases in (
+                ("step 5 (chunk_id offsets)",
+                 "    validateChunkIdOffsets(this._chunkMapView, this._chunkIds, total);",
+                 "    void 0;",
+                 [bad_paths["chunk_id_offset past end of chunk_ids.bin"],
+                  bad_paths["chunk_id not NUL-terminated"],
+                  bad_paths["chunk_id is not valid UTF-8"]]),
+                ("step 2 (binarizer.kind)",
+                 "    if (!SUPPORTED_BINARIZER_KINDS.includes(bin.kind)) {",
+                 "    if (false) {",
+                 [bad_paths["unknown binarizer.kind"]]),
+                ("step 6 (live_count)",
+                 "    if (declaredLive != null && this._rowOfLive.length !== declaredLive) {",
+                 "    if (false) {",
+                 [dense_only_live]),
+            ):
+                mutant = mutated_reader(old_src, new_src)
+                leaked = [p.name for p in cases
+                          if (js_open(p, reader=mutant) or {})
+                          .get("opened") is True]
+                g.known_bad(
+                    f"a js/kb-reader.js with {kb_label} validation removed "
+                    f"breaks reader parity",
+                    rejected=len(leaked) == len(cases),
+                    detail=f"{len(leaked)}/{len(cases)} corruptions leak "
+                           f"through the mutant: {leaked}",
+                    covers=("PARITY: js/kb-reader.js refuses every corruption",
+                            "step 6 in isolation: js/kb-reader.js refuses it"),
                 )
+
+            # ---- SPEC_v2 §remex codec: JS refuses, and says why ------------ #
+            # Not a corruption — a well-formed artifact this reader genuinely
+            # cannot decode (see REMEX_REFUSAL in js/kb-reader.js for why it is
+            # impossible rather than unimplemented).
+            #
+            # What the reader did BEFORE is the point. `_rowBytes` was
+            # `dim*k/8` unconditionally, which is the wrong width for remex's
+            # `dim*bits/8` — but the reader never got that far, because a remex
+            # .kbi ships no rotation sidecar and `bin.projection` is absent, so
+            # `projection || "haar"` sent it down the haar branch and it threw
+            # about a missing `binarizer/rotations.f32`. Two bit widths are
+            # exercised because the width arithmetic differs (bits=1 coincides
+            # at 4 bytes/row, bits=4 does not), and NEITHER changes the message:
+            # the caller was told to go find a rotations sidecar for an artifact
+            # that is not supposed to have one, and the implied remedy
+            # (repack with a shipped rotation) would not have helped.
+            def remex_refusal_ok(res: dict) -> bool:
+                err = (res or {}).get("error") or ""
+                return ((res or {}).get("opened") is False
+                        and "remex-lloyd-max" in err
+                        and "--projection srht" in err)
+
+            for bits, why in ((1, "remex row width coincides with dim*k/8"),
+                              (4, "remex row width differs from dim*k/8")):
+                rx = write_kbi(_as_remex(pristine, bits), tmp / f"remex-{bits}.kbi")
+                res = js_open(rx) or {}
+                g.check(remex_refusal_ok(res),
+                        f"remex-lloyd-max (bits={bits}) is refused by name, "
+                        f"with a remedy",
+                        f"{why}; opened={res.get('opened')} "
+                        f"error={str(res.get('error'))[:200]!r}")
+                if bits == 1:
+                    mutant = mutated_reader(
+                        "    if (bin.kind === REMEX_KIND) throw new Error(REMEX_REFUSAL);",
+                        "    void 0;")
+                    leak = js_open(rx, reader=mutant) or {}
+                    g.known_bad(
+                        "without the remex refusal, js/kb-reader.js fails on a "
+                        "remex .kbi with a message that never names the codec",
+                        rejected=not remex_refusal_ok(leak),
+                        detail=f"mutant opened={leak.get('opened')} "
+                               f"error={str(leak.get('error'))[:200]!r}",
+                        covers=("remex-lloyd-max (bits=1) is refused by name",),
+                    )
+
+            # ---- the haar sidecar asymmetry, and its remedy --------------- #
+            # A haar .kbi that arrives WITHOUT binarizer/rotations.f32 is
+            # readable by Python (it re-derives the planes from (dim, k, seed)
+            # and ignores the sidecar entirely) and unreadable by JS (it
+            # cannot). That asymmetry is why every haar artifact ships up to
+            # 9 MiB of rotations for a consumer that may never load them.
+            # The requirement stays — SPEC_v2 §binarizer/rotations.f32 makes it
+            # a MUST for readers in this position — but the refusal has to name
+            # the way out, which is repacking seed-only, not hunting for a file
+            # that was never generated.
+            no_sidecar = write_kbi(
+                {k: v for k, v in pristine.items()
+                 if not k.startswith("binarizer/rotations")},
+                tmp / "no-sidecar.kbi")
+            try:
+                kb_ns = KB.open(str(no_sidecar))
+                py_ns = f"opened, live_count={kb_ns.live_count}"
+                py_opened = True
+            except Exception as exc:  # noqa: BLE001
+                py_ns, py_opened = f"{type(exc).__name__}: {exc}", False
+            g.check(py_opened,
+                    "asymmetry: the Python reader OPENS a haar .kbi with no "
+                    "rotation sidecar (it re-derives from the seed)", py_ns)
+
+            def sidecar_msg_ok(res: dict) -> bool:
+                err = (res or {}).get("error") or ""
+                return ((res or {}).get("opened") is False
+                        and "rotations.f32" in err
+                        and "--projection srht" in err)
+
+            ns_res = js_open(no_sidecar) or {}
+            g.check(sidecar_msg_ok(ns_res),
+                    "js/kb-reader.js refuses it AND names the remedy "
+                    "(repack --projection srht)",
+                    f"opened={ns_res.get('opened')} "
+                    f"error={str(ns_res.get('error'))[:220]!r}")
+            mutant = mutated_reader(
+                '          "but binarizer/rotations.f32 is absent. " + SIDECAR_REMEDY',
+                '          "but binarizer/rotations.f32 is absent."')
+            leak = js_open(no_sidecar, reader=mutant) or {}
+            g.known_bad(
+                "a refusal that names the missing file but not the remedy "
+                "leaves the caller hunting for an artifact that was never "
+                "generated",
+                rejected=not sidecar_msg_ok(leak),
+                detail=f"mutant error={str(leak.get('error'))[:160]!r}",
+                covers=("js/kb-reader.js refuses it AND names the remedy",),
+            )
 
         # ---- coverage ---------------------------------------------------- #
         g.coverage(
@@ -416,15 +642,58 @@ def main() -> int:
             "this gate would notice."
         )
         g.coverage(
-            "Only the remax centered-simhash codec path is exercised: the "
-            "committed fixture is 1-bit haar. The remex and srht/rademacher "
-            "manifests take different branches at open and are unvalidated by "
-            "this gate. Measured, not assumed: `mutate.py --target "
-            "remax_kb/read_v2.py --max 45 -- <this gate>` kills 23/45, and "
-            "every survivor is on a codec/projection branch the fixture cannot "
-            "reach (the remex row_bytes arithmetic, the rademacher/srht/int8 "
-            "dispatch). Closing this needs fixtures in those codecs, not more "
-            "corruptions of this one."
+            "Only the remax centered-simhash codec path is exercised for "
+            "DECODING: the committed fixture is 1-bit haar. (The remex path is "
+            "now exercised on the JS side, but only to the point of refusal — "
+            "see the separate limit below.) The srht/rademacher manifests take "
+            "different branches at open and are unvalidated by this gate. "
+            "Measured, not assumed: `mutate.py --target remax_kb/read_v2.py "
+            "--max 45 -- <this gate>` kills 24/45 (re-measured 2026-08-03 "
+            "after the JS parity work; was 23/45). Of the 21 survivors, 17 sit "
+            "on a codec/projection branch the fixture cannot reach — the remex "
+            "`dim * bits // 8` row width (lines 88-90, 171) and the "
+            "rademacher/srht/int8 dispatch (lines 148-158). The other four are "
+            "not codec-specific and are real holes in THIS gate: two are "
+            "keyword-only markers in signatures (lines 39, 61), one is `Hit."
+            "verified`\'s default (line 53, checked by gate_cross_reader but "
+            "not here), and one is `_total_bits = row_bytes * 8` (line 90), "
+            "which this gate never reads because it asserts refusals rather "
+            "than similarity scores."
+        )
+        g.coverage(
+            "The sidecar asymmetry is checked at the level of the MESSAGE, not "
+            "the outcome. This gate asserts that js/kb-reader.js refuses a "
+            "sidecar-free haar .kbi and points at `--projection srht`; that "
+            "the suggested repack actually round-trips is a different claim, "
+            "made by tests/gates/gate_cross_reader.py, which builds an srht "
+            "artifact and reads it in both readers with no rotation entry "
+            "shipped."
+        )
+        g.coverage(
+            "Parity is asserted for REFUSALS of CORRUPTED artifacts, not for "
+            "acceptances. The two readers deliberately disagree on one class "
+            "of well-formed input: a remex-lloyd-max .kbi, which the Python "
+            "reader opens and js/kb-reader.js refuses by design. That is not a "
+            "bug being papered over — JS cannot re-derive remex's Lloyd-Max "
+            "centroids or its numpy-generated Haar rotation, and a remex .kbi "
+            "ships neither — but it does mean 'the readers agree' is a claim "
+            "about the corruption list, not about the format as a whole."
+        )
+        g.coverage(
+            "The remex artifacts here are SYNTHESIZED by re-badging the haar "
+            "fixture's manifest (kind, k=1, bits, zero mean, sidecar removed, "
+            "vectors.bin resized), because remex is an optional dependency "
+            "that is absent in some environments. That is enough to pin what "
+            "the JS reader DOES at open — which is decided by the manifest and "
+            "the row widths — and nothing at all about whether the Python "
+            "reader decodes a genuine remex corpus correctly."
+        )
+        g.coverage(
+            "The UTF-8 refusal is exercised with ONE malformed sequence (a "
+            "lone 0xFF). Python's strict codec and WHATWG TextDecoder are "
+            "believed to agree on overlong encodings, lone surrogates and "
+            "out-of-range code points, but none of those is tested here, so a "
+            "disagreement in that corner would pass this gate."
         )
         g.coverage(
             "Even the codec-specific unit tests do not close that hole: the "

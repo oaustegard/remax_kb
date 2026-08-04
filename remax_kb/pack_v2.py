@@ -103,7 +103,18 @@ class KBWriter:
         chunks_uri: str | None = None,
         source: str = "",
         rotations_quant: str = "float32",
-        projection: str = "haar",
+        # DEFAULT: 'srht'. Seed-only, so a v2 .kbi ships no
+        # `binarizer/rotations.*` sidecar at all and any conforming reader
+        # regenerates the planes from (dim, k, seed, srht_rounds). 'haar' has
+        # marginally better recall (srht recovers ~85% of the Rademacher->Haar
+        # gap, so it sits slightly BELOW haar, within noise) but is
+        # numpy-only: its planes come from PCG64 + Ziggurat + LAPACK QR, which
+        # a JavaScript reader cannot reproduce, and a mismatched projection is
+        # not an approximation — it flips ~50% of code bits. Existing artifacts
+        # are unaffected: `binarizer.projection` is recorded in the manifest
+        # and readers dispatch on it, so this changes only what NEW packs
+        # produce. Pass projection="haar" to keep the old behaviour.
+        projection: str = "srht",
         srht_rounds: int = 3,
         codec: str = "remax",
         bits: int = 4,
@@ -750,6 +761,16 @@ class KBWriter:
         total = manifest["chunks"]["total_rows"]
         vectors = vectors.reshape(total, row_bytes)
         # Preserve projection + quantization across mutation re-commits.
+        #
+        # The "haar" fallback is DELIBERATE and must NOT be tracked to the
+        # constructor default. It is not a default, it is a decoding fact: an
+        # artifact whose manifest omits `projection` was written when haar was
+        # the default, and its corpus codes are packed against Haar planes.
+        # Re-committing it as srht would re-pack new rows in a statistically
+        # independent sign-space from the existing ones -- ~50% of bits flipped
+        # between old and new rows in one index, with no error anywhere. Every
+        # writer since 2026-08 emits the field explicitly, so this branch only
+        # ever sees pre-flip artifacts.
         self._projection = bq.get("projection", "haar")
         self._srht_rounds = bq.get("srht_rounds", 3)
         self._rotations_quant = bq.get("rotations_quant", "none" if self._codec == "remex" else "float32")

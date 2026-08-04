@@ -24,13 +24,18 @@ def js_encode_python_emulation(x, rotations, d, k):
 
     Big-endian bit-pack: bit i lands at mask `1 << (7 - i & 7)` within
     its byte. Rotations are stack-ordered along the codeword.
+
+    STRICT ``> 0``, mirroring the reader after the 2026-08 sign-convention fix
+    and matching ``remax.packing.encode_signs`` ("x > 0 → bit 1"). ``>= 0``
+    here would silently re-introduce the divergence this file is meant to
+    detect — see ``test_exact_zero_projection_packs_like_remax``.
     """
     row_bytes = (d * k) // 8
     code = np.zeros(row_bytes, dtype=np.uint8)
     for j in range(k):
         proj = x @ rotations[j]
         for col in range(d):
-            if proj[col] >= 0:
+            if proj[col] > 0:
                 bit_idx = j * d + col
                 code[bit_idx // 8] |= 1 << (7 - (bit_idx % 8))
     return code
@@ -48,6 +53,39 @@ def test_js_emulation_matches_remax(d, k, seed):
             err_msg=f"d={d} k={k} seed={seed} trial={trial}")
 
 
+def test_exact_zero_projection_packs_like_remax():
+    """Issue #20 mechanism (a): the sign convention AT exactly 0.0.
+
+    Constructed, not sampled. With ±1 rademacher planes and ``x = e_0 - e_1``,
+    every output column where the two plane entries agree projects to exactly
+    0.0 — in float32, in float64, under any summation order. So this test
+    isolates the *convention* from the float-summation-order mechanism (b),
+    which no amount of sampling can separate. ``>= 0`` fails it; ``> 0`` passes.
+
+    The Node-executed counterpart lives in tests/gates/gate_cross_reader.py
+    (`exact_zero_sign_parity`), which drives the real JS through the same
+    construction and carries a known-bad that restores ``>= 0``.
+    """
+    from remax_kb.projection import rademacher_planes
+
+    d, k, seed = 32, 2, 12345
+    planes = rademacher_planes(d, k, seed).astype(np.float32)
+    x = np.zeros(d, dtype=np.float32)
+    x[0], x[1] = 1.0, -1.0
+
+    proj = np.concatenate([x @ planes[j] for j in range(k)])
+    n_zero = int((proj == 0.0).sum())
+    assert 0 < n_zero < d * k, (
+        f"probe is vacuous: {n_zero} exact zeros out of {d * k}")
+
+    q = StackedSignBitQuantizer(d=d, k=k, seed=seed)
+    q.rotations_ = planes.astype(q.dtype)
+    for v in (x, -x):
+        ref = q.encode(np.asarray(v)[None, :])[0]
+        emu = js_encode_python_emulation(v, planes, d, k)
+        np.testing.assert_array_equal(emu, ref)
+
+
 def js_dequant_int8_emulation(codes_i8, scale, d, k):
     """Mirror of the int8 dequant the JS reader must perform on load:
     rot[j, row, col] = i8[j, row, col] * scale[j, col]  (per-output-column).
@@ -63,10 +101,19 @@ def js_dequant_int8_emulation(codes_i8, scale, d, k):
 
 
 @pytest.mark.xfail(
-    reason="pre-existing: JS-emulation encode vs remax matmul can disagree on the "
-    "sign of a near-zero projected coordinate (float summation order). Tracked "
-    "separately; orthogonal to the remex codec. strict=False so it xpasses if a "
-    "numpy/BLAS change makes it agree.",
+    reason="issue #20 mechanism (b) ONLY: float summation order. The emulation "
+    "projects one stack at a time (x @ rotations[j]) while remax does a single "
+    "matmul against the pre-flattened (d, k*d) matrix, so BLAS may accumulate "
+    "in a different order and land on the opposite side of zero for a NEAR-zero "
+    "projected coordinate. Mechanism (a), the `>= 0` vs `> 0` sign convention "
+    "at EXACTLY 0.0, was closed 2026-08 and is now pinned by "
+    "test_exact_zero_projection_packs_like_remax plus the exact-zero probe in "
+    "tests/gates/gate_cross_reader.py — so this marker no longer covers it. "
+    "Kept strict=False because these dequantized-int8 planes have never "
+    "actually produced a near-zero coordinate at these (d, k, seed): the "
+    "parametrizations xpass, on the arithmetic staying lucky rather than on any "
+    "guarantee. Making it strict would assert a divergence that is not there; "
+    "removing it would assert an agreement nothing in the code enforces.",
     strict=False,
 )
 @pytest.mark.parametrize("d,k,seed", [(32, 4, 42), (64, 2, 0), (256, 8, 7)])
