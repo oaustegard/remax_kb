@@ -19,7 +19,7 @@ from urllib.parse import urljoin, urlparse
 import bm25s
 import numpy as np
 
-from ._hamming import _popcount_rows
+from ._hamming import hamming_scan
 
 
 SPEC_VERSION = "2"
@@ -448,11 +448,14 @@ class KB:
 
         q_code = self.encode_query_code(vec)
 
-        # Hamming scan, skipping tombstones
-        # XOR rows, sum popcount per row
-        xor = np.bitwise_xor(self._vectors, q_code[None, :])
-        # popcount per row via hardware POPCNT (see _hamming._popcount_rows)
-        dists = _popcount_rows(xor)
+        # Hamming scan, skipping tombstones.
+        # Delegated rather than inlined: hamming_scan takes the compiled kernel
+        # when remax._native is available, and only materialises an (N, B) XOR
+        # on the NumPy tiers. Inlining the XOR here forced the NumPy path and
+        # that temporary on every query regardless of what was available.
+        dists = hamming_scan(self._vectors, q_code)
+        # dists is a fresh array per call, so the tombstone sentinel written
+        # below cannot leak into a later query.
         # Mask tombstones to a large value so they don't appear
         tomb_mask = self._tombstone_mask()
         dists[tomb_mask] = self._total_bits + 1  # sentinel: never selected

@@ -1,10 +1,13 @@
 """Unit tests for the Hamming-distance scan kernel (remax_kb/_hamming.py).
 
-These are deliberately remax-free so the popcount fast path is exercised in CI
-even when the embedder stack isn't installed. The fast path (uint64 view +
-np.bitwise_count, numpy>=2.0) must return results bit-for-bit identical to the
-reference per-byte popcount LUT, for any row width — including widths that are
-not a multiple of 8 bytes (e.g. dim*k not a multiple of 64). See issue #15.
+Every kernel tier must return results bit-for-bit identical to the reference
+per-byte popcount LUT, for any row width — including widths that are not a
+multiple of 8 bytes (e.g. dim*k not a multiple of 64). See issue #15.
+
+These need `remax` (the module has always imported `stable_top_k` from it) but
+not the embedder stack, so they run in CI without models. The tier tests at the
+bottom force each kernel explicitly rather than testing whichever one this
+machine offers.
 """
 from __future__ import annotations
 
@@ -91,3 +94,88 @@ def test_top_k_edge_cases() -> None:
     assert np.array_equal(top_k(dists, 0), np.empty(0, dtype=np.intp))
     # k larger than N clamps; ties broken by lower index first (stable)
     assert np.array_equal(top_k(dists, 10), np.array([4, 1, 3, 2, 0]))
+
+
+# --------------------------------------------------------------------------- #
+# Kernel tiers (remax_kb#15 follow-up, 2026-08-09)
+#
+# hamming_scan picks one of three kernels: remax's compiled _native scan, the
+# uint64 np.bitwise_count path, or the per-byte LUT. The tests above only
+# exercise whichever tier this machine happens to offer. These force each one,
+# because the whole point of the ladder is that the choice is invisible in the
+# result and visible only in the clock.
+# --------------------------------------------------------------------------- #
+
+from remax_kb import _hamming as _h  # noqa: E402
+
+
+def _codes(n=1500, b=32, seed=7):
+    rng = np.random.default_rng(seed)
+    return (np.ascontiguousarray(rng.integers(0, 256, size=(n, b), dtype=np.uint8)),
+            rng.integers(0, 256, size=b, dtype=np.uint8))
+
+
+def test_native_and_numpy_tiers_agree(monkeypatch: pytest.MonkeyPatch) -> None:
+    codes, query = _codes()
+    ref = _ref_scan(codes, query)
+
+    monkeypatch.setattr(_h, "_NATIVE_AVAILABLE", False)
+    numpy_tier = hamming_scan(codes, query)
+    monkeypatch.undo()
+
+    np.testing.assert_array_equal(numpy_tier, ref)
+    np.testing.assert_array_equal(hamming_scan(codes, query), ref)
+    assert numpy_tier.dtype == np.int32
+
+
+def test_lut_tier_agrees(monkeypatch: pytest.MonkeyPatch) -> None:
+    """numpy < 2.0 floor: no bitwise_count, no native."""
+    codes, query = _codes()
+    monkeypatch.setattr(_h, "_NATIVE_AVAILABLE", False)
+    monkeypatch.setattr(_h, "_HAS_BITWISE_COUNT", False)
+    np.testing.assert_array_equal(hamming_scan(codes, query), _ref_scan(codes, query))
+
+
+def test_native_tier_is_actually_reached() -> None:
+    """The regression this fixes: remax was a hard dependency and the compiled
+    kernel shipped in it, but the scan never called it."""
+    if not _h._NATIVE_AVAILABLE:
+        pytest.skip("no compiler in this environment; native tier unavailable")
+    codes, query = _codes()
+    seen: list[int] = []
+    real = _h._remax_hamming_distances
+
+    def spy(c, q, **kw):
+        seen.append(len(c))
+        return real(c, q, **kw)
+
+    orig, _h._remax_hamming_distances = _h._remax_hamming_distances, spy
+    try:
+        got = hamming_scan(codes, query)
+    finally:
+        _h._remax_hamming_distances = orig
+    assert seen == [len(codes)], "hamming_scan did not delegate to remax"
+    np.testing.assert_array_equal(got, _ref_scan(codes, query))
+
+
+def test_out_buffer_is_reused_and_fully_overwritten() -> None:
+    if not _h._NATIVE_AVAILABLE:
+        pytest.skip("out= is a native-tier passthrough")
+    codes, q1 = _codes(seed=1)
+    _, q2 = _codes(seed=2)
+    buf = np.empty(len(codes), dtype=np.int32)
+
+    r1 = hamming_scan(codes, q1, out=buf)
+    assert r1 is buf
+    r2 = hamming_scan(codes, q2, out=buf)
+    # No stale values from the previous query survive.
+    np.testing.assert_array_equal(r2, _ref_scan(codes, q2))
+
+
+def test_threads_do_not_change_the_result() -> None:
+    if not _h._NATIVE_AVAILABLE:
+        pytest.skip("threads= is a native-tier passthrough")
+    codes, query = _codes(n=40_000)
+    ref = _ref_scan(codes, query)
+    for threads in (1, 2, "auto"):
+        np.testing.assert_array_equal(hamming_scan(codes, query, threads=threads), ref)
