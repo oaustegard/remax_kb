@@ -51,6 +51,12 @@ class Hit:
     meta: dict[str, Any] = field(default_factory=dict)
     sha256: str | None = None
     verified: bool = False
+    # Per-hit score provenance. Empty on hits built by the retrieval legs
+    # themselves; populated by ``KB.search`` for every hit it returns. See
+    # ``KB.search`` for the key list. Purely diagnostic — nothing in the
+    # library reads it, and it costs no extra retrieval work: every value is
+    # a loop index or an intermediate the fusion already computed.
+    explain: dict[str, Any] = field(default_factory=dict)
 
 
 class KB:
@@ -287,6 +293,15 @@ class KB:
           fusion. ``None`` → ``max(k * 8, 64)``. Deeper pools let fusion surface
           a document that ranks mid-list in each modality but agrees across both.
         * ``rrf_c`` — the RRF constant (default 60).
+
+        Every returned hit carries an ``explain`` dict describing how its score
+        was arrived at: ``mode`` (``rrf`` / ``weighted`` / ``dense-only``),
+        ``dense_rank`` and ``lex_rank`` (1-based within the over-fetched pool,
+        ``None`` if that leg did not retrieve the row), ``legs``, the per-leg
+        score contributions, and a shared ``query`` sub-dict from
+        ``explain_query``. The ranks are what RRF actually consumes and were
+        previously discarded, which left ``fused=0.0163`` unattributable to
+        either leg.
         """
         self._validate_embedder(embedder.fingerprint())
 
@@ -296,6 +311,7 @@ class KB:
         # Semantic floor: drop below-noise dense candidates before fusion so a
         # nonsense query cannot inject a spurious "nearest" doc into the results.
         floor = self._resolve_min_sim(min_sim)
+        dense_before_floor = len(dense_ranked)
         if floor is not None:
             dense_ranked = [
                 h for h in dense_ranked
@@ -305,9 +321,26 @@ class KB:
         # Lexical path (optional)
         lex_ranked = self._bm25_search(query) if self._bm25 is not None else None
 
+        # One shared per-query diagnostic, referenced (not copied) by each hit.
+        query_explain = self.explain_query(query)
+        query_explain["dense_candidates"] = dense_before_floor
+        query_explain["dense_kept_after_floor"] = len(dense_ranked)
+        query_explain["min_sim_floor"] = floor
+        query_explain["lex_candidates"] = (
+            None if lex_ranked is None else len(lex_ranked)
+        )
+
         # Fusion
         if lex_ranked is None:
             top = dense_ranked[:k]
+            for rank, hit in enumerate(top, start=1):
+                hit.explain = {
+                    "mode": "dense-only",
+                    "legs": ["dense"],
+                    "dense_rank": rank,
+                    "lex_rank": None,
+                    "query": query_explain,
+                }
         else:
             if over_fetch is None:
                 over_fetch = max(k * 8, 64)
@@ -315,11 +348,37 @@ class KB:
                 dense_ranked, lex_ranked, over_fetch=over_fetch, alpha=alpha,
                 rrf_c=rrf_c,
             )[:k]
+            for hit in top:
+                hit.explain["over_fetch"] = over_fetch
+                hit.explain["query"] = query_explain
 
         # Enrich with chunk_id (still no text)
         for hit in top:
             hit.chunk_id = self._chunk_id_at(hit.row)
         return top
+
+    def explain_query(self, query: str) -> dict[str, Any]:
+        """Lexical-leg diagnostics for ``query``, independent of retrieval.
+
+        ``oov`` is the list of query tokens absent from the BM25 vocabulary.
+        A fully out-of-vocabulary query scores zero on the lexical arm and
+        hybrid search silently degrades to dense-only — the exact failure the
+        ``tokenize_query`` docstring documents, previously invisible from
+        outside. ``None`` for the vocabulary fields when the ``.kbi`` ships no
+        ``bm25/`` subdir (dense-only KB).
+        """
+        tokens = tokenize_query(query)
+        if self._bm25 is None:
+            return {"tokens": tokens, "in_vocab": None, "oov": None,
+                    "vocab_size": None}
+        vocab = getattr(self._bm25, "vocab_dict", None) or {}
+        in_vocab = [t for t in tokens if t in vocab]
+        return {
+            "tokens": tokens,
+            "in_vocab": in_vocab,
+            "oov": [t for t in tokens if t not in vocab],
+            "vocab_size": len(vocab),
+        }
 
     def fetch(self, hits: list[Hit]) -> list[Hit]:
         """Fetch chunk text + meta for hits via HTTP Range (or local file)."""
@@ -686,9 +745,15 @@ def _fuse_ranks(
         C = rrf_c
         merged: dict[int, Hit] = {}
         for idx, h in enumerate(dense_n):
+            contrib = 1.0 / (C + idx + 1)
             merged[h.row] = Hit(
                 row=h.row, chunk_id="", dense_dist=h.dense_dist,
-                dense_sim=h.dense_sim, fused=1.0 / (C + idx + 1),
+                dense_sim=h.dense_sim, fused=contrib,
+                explain={
+                    "mode": "rrf", "rrf_c": C, "legs": ["dense"],
+                    "dense_rank": idx + 1, "lex_rank": None,
+                    "rrf_dense": contrib, "rrf_lex": 0.0,
+                },
             )
         for idx, h in enumerate(lex_n):
             prev = merged.get(h.row)
@@ -696,10 +761,18 @@ def _fuse_ranks(
             if prev is None:
                 merged[h.row] = Hit(
                     row=h.row, chunk_id="", bm25_score=h.bm25_score, fused=score_add,
+                    explain={
+                        "mode": "rrf", "rrf_c": C, "legs": ["lex"],
+                        "dense_rank": None, "lex_rank": idx + 1,
+                        "rrf_dense": 0.0, "rrf_lex": score_add,
+                    },
                 )
             else:
                 prev.bm25_score = h.bm25_score
                 prev.fused = (prev.fused or 0) + score_add
+                prev.explain["legs"] = ["dense", "lex"]
+                prev.explain["lex_rank"] = idx + 1
+                prev.explain["rrf_lex"] = score_add
         return sorted(merged.values(), key=lambda h: -(h.fused or 0))
     else:
         # Weighted with min-max norm within over-fetched pool
@@ -713,21 +786,35 @@ def _fuse_ranks(
             return 1.0 if l_max == l_min else (s - l_min) / (l_max - l_min)
 
         merged: dict[int, Hit] = {}
-        for h in dense_n:
+        for idx, h in enumerate(dense_n):
+            contrib = alpha * norm_d(h.dense_dist or d_max)
             merged[h.row] = Hit(
                 row=h.row, chunk_id="", dense_dist=h.dense_dist, dense_sim=h.dense_sim,
-                fused=alpha * norm_d(h.dense_dist or d_max),
+                fused=contrib,
+                explain={
+                    "mode": "weighted", "alpha": alpha, "legs": ["dense"],
+                    "dense_rank": idx + 1, "lex_rank": None,
+                    "weighted_dense": contrib, "weighted_lex": 0.0,
+                },
             )
-        for h in lex_n:
+        for idx, h in enumerate(lex_n):
             prev = merged.get(h.row)
             add = (1 - alpha) * norm_l(h.bm25_score or l_min)
             if prev is None:
                 merged[h.row] = Hit(
                     row=h.row, chunk_id="", bm25_score=h.bm25_score, fused=add,
+                    explain={
+                        "mode": "weighted", "alpha": alpha, "legs": ["lex"],
+                        "dense_rank": None, "lex_rank": idx + 1,
+                        "weighted_dense": 0.0, "weighted_lex": add,
+                    },
                 )
             else:
                 prev.bm25_score = h.bm25_score
                 prev.fused = (prev.fused or 0) + add
+                prev.explain["legs"] = ["dense", "lex"]
+                prev.explain["lex_rank"] = idx + 1
+                prev.explain["weighted_lex"] = add
         return sorted(merged.values(), key=lambda h: -(h.fused or 0))
 
 
