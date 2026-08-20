@@ -125,7 +125,7 @@ pip install -e .
 
 ```bash
 remax-kb pack ./my-docs/ -o knowledge.kb --dim 256 --k 8 \
-    --embedder jina-onnx          # or: gemini, jina-torch, lfm25
+    --embedder jina-onnx          # or: gemini, jina-torch, lfm25, leaf-mt
 ```
 
 Built-in handlers cover `.md / .markdown / .txt / .rst / .html / .htm
@@ -133,6 +133,38 @@ Built-in handlers cover `.md / .markdown / .txt / .rst / .html / .htm
 Frontmatter is stripped from markdown; HTML pulls main content out of
 `<article>` / `<main>` / `<body>`; PDFs use `pypdf` and emit empty
 text with a warning rather than crashing on encrypted / scanned files.
+
+#### Embedders: quality default vs small artifact
+
+| `--embedder` | weights | runtime deps | dim |
+|---|---|---|---|
+| `jina-onnx` (default) | 847 MB fp32 / 138 MB q4 | onnxruntime + tokenizers | 768 |
+| `jina-torch` | as above | torch + peft | 768 |
+| `gemini` | none (API) | network + key | configurable |
+| `lfm25` | 350M params | torch + transformers<5.12 | 1024 |
+| **`leaf-mt`** | **23.9 MB int8** | **onnxruntime + tokenizers** | **1024** |
+
+`leaf-mt` ([MongoDB/mdbr-leaf-mt](https://huggingface.co/MongoDB/mdbr-leaf-mt))
+is the small-artifact rung: a 23M-parameter, MRL-trained encoder distilled from
+`mxbai-embed-large-v1`, shipped as an int8 ONNX that is *faster than its own
+fp32* at one thread. Reach for it when the `.kb` has to travel somewhere that
+cannot carry a 138-847 MB encoder — an offline box, a phone-sized target, a
+container you would rather not put torch in. `jina-onnx` remains the quality
+default.
+
+```bash
+remax-kb pack ./my-docs/ -o knowledge.kbi --v2 --embedder leaf-mt --dim 1024 \
+    --codec remex --bits 4
+```
+
+Both model files and the tokenizer are fetched once from a pinned HF revision
+and SHA256-verified, or point at local copies with
+`$REMAX_KB_LEAF_MT_TOKENIZER_PATH` / `model_path=`.
+
+One caveat specific to this embedder: the int8 graph is padding-sensitive, so a
+row's vector shifts by ~0.99 cosine depending on the batch it was padded
+against. Retrieval is unaffected, but a `.kb`'s **bit-identity is conditional on
+`batch_size`** as well as on corpus and parameters. See the class docstring.
 
 #### Codec: 1-bit SimHash (default) vs multi-bit remex
 

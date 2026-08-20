@@ -1,7 +1,7 @@
 """Thin embedder wrappers exposing the ``Embedder`` protocol expected by
 the reader and packer.
 
-Three implementations:
+Five implementations:
 
 - :class:`JinaONNXEmbedder` — torch-free runtime path. Wraps
   ``jina_v5_nano_mirror.scripts.embed_onnx``. Downloads the merged-
@@ -15,6 +15,12 @@ Three implementations:
   local model; talks to ``generativelanguage.googleapis.com``. The
   ``.kb`` carries no ``release_url`` for this embedder; readers
   identify it by ``model_id`` alone.
+
+- :class:`LeafMTONNXEmbedder` — torch-free runtime path for
+  ``MongoDB/mdbr-leaf-mt``. int8 ONNX, 23.9 MB of weights, reads the
+  graph's own ``sentence_embedding`` output (mean-pool + Dense). The
+  small-artifact rung: use it when the ``.kb`` must ship somewhere that
+  cannot carry a 138-847 MB encoder.
 
 - :class:`LFM25Embedder` — packer-side torch path for
   ``LiquidAI/LFM2.5-Embedding-350M`` (HF-hosted, ``trust_remote_code``).
@@ -114,6 +120,45 @@ JINA_V5_NANO_Q4_ONNX_URL = f"{JINA_V5_NANO_RELEASE_BASE}/model.q4.onnx"
 JINA_V5_NANO_Q4_ONNX_SHA256 = (
     "b8b18777a9b49bafb5d14f7db3e2687b7bc60485500c39cd9febdcf1d2552e15"
 )
+
+
+# ── MongoDB mdbr-leaf-mt (int8 ONNX; torch-free) ─────────────────────────────
+# 23M params, 1024-d, MRL-trained, distilled from mxbai-embed-large-v1. The
+# shipped `onnx/model_quantized.onnx` is int8 and, unlike some int8 exports, is
+# FASTER than its own fp32 (7-8 vs 15 ms/query at 1 thread) with no significant
+# retrieval cost. Split ONNX (graph + external-data weights), pinned by commit
+# and per-file sha256.
+#
+# Chosen here for the size rung: 23.9 MB of weights against jina-v5-nano's
+# 138 MB q4 / 847 MB fp32, which is what makes an offline `.kbi` shippable to a
+# phone-sized target. Its `sentence_embedding` graph output already applies the
+# upstream mean-pool + 384->1024 Dense head, so this embedder is pure
+# onnxruntime + tokenizers with no safetensors read and no torch.
+LEAF_MT_MODEL_ID = "MongoDB/mdbr-leaf-mt"
+LEAF_MT_REVISION = "1ed41b22ce166d66c24f88ebfc340e1f03adb20f"
+_LEAF_MT_BASE = (
+    f"https://huggingface.co/{LEAF_MT_MODEL_ID}/resolve/{LEAF_MT_REVISION}"
+)
+LEAF_MT_ONNX_URL = f"{_LEAF_MT_BASE}/onnx/model_quantized.onnx"
+LEAF_MT_ONNX_SHA256 = (
+    "2a3541f3f156bc420d593fe8bcde37597980f0780035e6d0fb9b6a2f949d8855"
+)
+LEAF_MT_DATA_URL = f"{_LEAF_MT_BASE}/onnx/model_quantized.onnx_data"
+LEAF_MT_DATA_SHA256 = (
+    "65dc11dae54946d5c18390e52b0f92ed04215d0965b7f0ea6fef71cf4bfce907"
+)
+LEAF_MT_TOKENIZER_URL = f"{_LEAF_MT_BASE}/tokenizer.json"
+LEAF_MT_TOKENIZER_SHA256 = (
+    "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0"
+)
+LEAF_MT_FULL_DIM = 1024
+LEAF_MT_POOLING = "mean+dense"
+LEAF_MT_MAX_SEQ_LENGTH = 512
+# config_sentence_transformers.json: queries carry a prefix, documents none.
+LEAF_MT_PROMPTS = {
+    "query": "Represent this sentence for searching relevant passages: ",
+    "document": "",
+}
 
 
 def _cache_root() -> Path:
@@ -404,6 +449,172 @@ class JinaOursQ4ONNXEmbedder(JinaQ4ONNXEmbedder):
 # --------------------------------------------------------------------- #
 # Torch (packer) — supports any task adapter
 # --------------------------------------------------------------------- #
+
+
+class LeafMTONNXEmbedder:
+    """MongoDB ``mdbr-leaf-mt`` int8 ONNX — torch-free, 23.9 MB of weights.
+
+    The small-artifact rung of the registry. `jina-onnx` is the quality
+    default; this is the one to reach for when the `.kb` has to ship somewhere
+    that cannot carry 138-847 MB of encoder, and it is the only local embedder
+    here whose runtime needs nothing but ``onnxruntime + tokenizers``.
+
+    Model facts, taken from the upstream repo (do not "fix" these by guessing):
+
+    * ``full_dim`` = 1024, via a 384-hidden BERT plus a ``384 -> 1024`` Dense
+      head. The transformer is 6 layers x 384 hidden x 1536 FFN, 23M params.
+    * pooling = **mean over the attention mask, then the Dense head**. The
+      shipped graph exposes this as its ``sentence_embedding`` output, so this
+      class reads that tensor rather than re-implementing the pooling: measured
+      cosine **0.9998** against a manual mean-pool + Dense-from-safetensors on
+      the same inputs. Reading the graph output is what keeps the runtime
+      torch-free and drops the ``2_Dense/model.safetensors`` dependency.
+    * prompts are **string prefixes** — queries get ``"Represent this sentence
+      for searching relevant passages: "``, documents get nothing
+      (``config_sentence_transformers.json``).
+    * ``max_seq_length`` = 512.
+    * the ST pipeline has a Normalize module, but the ONNX graph does not
+      include it, so L2 normalization is done here with a zero-norm guard.
+    * the graph takes ``token_type_ids`` alongside ``input_ids`` and
+      ``attention_mask``; it is fed as zeros (single-segment input).
+
+    The int8 export is the one to use: upstream also ships q4, which is slower
+    than fp32 at 1 thread *and* the only export with a directional retrieval
+    dip. Both files of the split ONNX are SHA256-pinned at
+    :data:`LEAF_MT_REVISION`.
+
+    ``encode()`` sorts by length before batching and scatters back to input
+    order — padding is to the batch's longest sequence, so length-sorting is
+    worth roughly 2x.
+
+    **Batch boundaries are not numerically inert here**, unlike the CLS-pooled
+    :class:`LFM25Embedder`. The int8 graph is padding-sensitive: a row encoded
+    alongside a much longer neighbour lands ~0.99 cosine from the same row
+    encoded alone. This is the quantized transformer, not the pooling — a
+    manual masked mean over ``last_hidden_state`` drifts by the same amount, so
+    reading ``sentence_embedding`` neither causes nor worsens it. The practical
+    consequence for this repo's bit-identity guarantee: a ``.kb`` built with
+    this embedder is reproducible given the same corpus, parameters **and
+    ``batch_size``**, and re-packing the same corpus at a different batch size
+    will produce a near-identical rather than an identical artifact. Retrieval
+    is unaffected at any batch size tried; exact-hash reproduction is not.
+    """
+
+    model_id = LEAF_MT_MODEL_ID
+    model_revision = LEAF_MT_REVISION
+    task_adapter = "retrieval"
+    pooling = LEAF_MT_POOLING
+    full_dim = LEAF_MT_FULL_DIM
+    normalize_l2 = True
+    release_url = LEAF_MT_ONNX_URL
+    release_sha256 = LEAF_MT_ONNX_SHA256
+    prompts = dict(LEAF_MT_PROMPTS)
+
+    def __init__(
+        self,
+        *,
+        model_path: str | Path | None = None,
+        tokenizer_path: str | Path | None = None,
+        max_length: int = LEAF_MT_MAX_SEQ_LENGTH,
+        batch_size: int = 16,
+    ):
+        self._session = None
+        self._tokenizer = None
+        self._input_names: set[str] = set()
+        self._max_length = int(max_length)
+        self._batch_size = max(1, int(batch_size))
+        self._model_path = Path(model_path) if model_path else None
+        self._tokenizer_path = Path(tokenizer_path) if tokenizer_path else None
+
+    def fingerprint(self) -> dict[str, Any]:
+        return {
+            "model_id": self.model_id,
+            "task_adapter": self.task_adapter,
+            "pooling": self.pooling,
+            "full_dim": self.full_dim,
+        }
+
+    def _resolve_model(self) -> Path:
+        if self._model_path is not None:
+            return self._model_path
+        return _download_split_onnx(
+            LEAF_MT_ONNX_URL,
+            LEAF_MT_ONNX_SHA256,
+            LEAF_MT_DATA_URL,
+            LEAF_MT_DATA_SHA256,
+            _cache_root() / "leaf-mt",
+            onnx_name="model_quantized.onnx",
+            data_name="model_quantized.onnx_data",
+        )
+
+    def _resolve_tokenizer(self) -> Path:
+        if self._tokenizer_path is not None:
+            return self._tokenizer_path
+        env_path = os.environ.get("REMAX_KB_LEAF_MT_TOKENIZER_PATH")
+        if env_path:
+            return Path(env_path)
+        # Unlike jina-v5-nano, the tokenizer is a plain file on the pinned HF
+        # revision, so it is fetched and verified like any other asset and the
+        # embedder bootstraps from URLs alone.
+        dst = _cache_root() / "leaf-mt" / "tokenizer.json"
+        _download(LEAF_MT_TOKENIZER_URL, dst, LEAF_MT_TOKENIZER_SHA256)
+        return dst
+
+    def _load(self) -> None:
+        if self._session is not None:
+            return
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        model_path = self._resolve_model()
+        tokenizer_path = self._resolve_tokenizer()
+        self._session = ort.InferenceSession(
+            str(model_path), providers=["CPUExecutionProvider"]
+        )
+        self._input_names = {i.name for i in self._session.get_inputs()}
+        self._tokenizer = Tokenizer.from_file(str(tokenizer_path))
+        self._tokenizer.enable_truncation(max_length=self._max_length)
+
+    def _encode_batch(self, texts: list[str]) -> np.ndarray:
+        encoded = self._tokenizer.encode_batch(texts)
+        max_len = max(len(e.ids) for e in encoded)
+        ids = np.zeros((len(encoded), max_len), dtype=np.int64)
+        mask = np.zeros((len(encoded), max_len), dtype=np.int64)
+        for i, e in enumerate(encoded):
+            L = len(e.ids)
+            ids[i, :L] = e.ids
+            mask[i, :L] = e.attention_mask
+
+        feed = {"input_ids": ids, "attention_mask": mask}
+        if "token_type_ids" in self._input_names:
+            feed["token_type_ids"] = np.zeros_like(ids)
+
+        # The graph's own pooled output: masked mean + the 384->1024 Dense head.
+        pooled = self._session.run(["sentence_embedding"], feed)[0]
+        pooled = np.asarray(pooled, dtype=np.float32)
+
+        norms = np.linalg.norm(pooled, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        return (pooled / norms).astype(np.float32)
+
+    def encode(self, texts: list[str], *, prompt: str) -> np.ndarray:
+        if prompt not in self.prompts:
+            raise ValueError(
+                f"unknown prompt {prompt!r}; expected one of {list(self.prompts)}"
+            )
+        if not texts:
+            return np.zeros((0, self.full_dim), dtype=np.float32)
+
+        self._load()
+        prefix = self.prompts[prompt]
+        prefixed = [f"{prefix}{t}" for t in texts]
+
+        order = np.argsort([len(t) for t in prefixed], kind="stable")
+        out = np.empty((len(prefixed), self.full_dim), dtype=np.float32)
+        for start in range(0, len(order), self._batch_size):
+            idx = order[start : start + self._batch_size]
+            out[idx] = self._encode_batch([prefixed[i] for i in idx])
+        return out
 
 
 class JinaTorchEmbedder:
