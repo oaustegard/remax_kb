@@ -50,9 +50,12 @@ def _build_embedder(name: str, args: argparse.Namespace):
     if name == "lfm25":
         from .embedders import LFM25Embedder
         return LFM25Embedder()
+    if name in ("leaf-mt", "leaf-mt-int8"):
+        from .embedders import LeafMTONNXEmbedder
+        return LeafMTONNXEmbedder()
     raise SystemExit(
         f"unknown embedder {name!r}; choose from: jina-onnx, jina-torch, "
-        f"gemini, lfm25"
+        f"gemini, lfm25, leaf-mt"
     )
 
 
@@ -375,7 +378,8 @@ def _embedder_args(p: argparse.ArgumentParser) -> None:
         help=(
             "embedder backend: jina-onnx (default), jina-torch, gemini, "
             "lfm25 (LiquidAI/LFM2.5-Embedding-350M; needs torch + "
-            "transformers<5.12)"
+            "transformers<5.12), leaf-mt (MongoDB/mdbr-leaf-mt int8 ONNX; "
+            "torch-free, 23.9 MB weights - the small-artifact option)"
         ),
     )
     p.add_argument(
