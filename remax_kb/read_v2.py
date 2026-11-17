@@ -92,6 +92,8 @@ class KB:
         # "anything we failed to recognise".
         self._codec = "remex" if b["kind"] == REMEX_KIND else "remax"
         self._bits = b.get("bits", 1)
+        from ._remex import stored_rotation
+        self._remex_rotation = stored_rotation(b) if self._codec == "remex" else None
         self._row_bytes = (self._dim * self._bits // 8) if self._codec == "remex" else (self._dim * self._k // 8)
         self._total_bits = self._row_bytes * 8
         self._remex_docmat = None  # lazily decoded corpus (remex only)
@@ -448,16 +450,14 @@ class KB:
     # ------------------------------------------------------------------ #
     def _remex_doc_matrix(self) -> np.ndarray:
         """Decode the packed remex corpus codes to approximate (N, dim) float
-        vectors once, cached. remex requires an L2-normalizing embedder, so
-        per-row norms are not stored and are reconstructed as 1.0."""
+        vectors once, cached. Rotation comes from the manifest; an artifact
+        that predates the field was encoded with Haar."""
         if self._remex_docmat is None:
-            from remex import Quantizer, unpack, CompressedVectors
-            n = self._vectors.shape[0]
-            flat = np.ascontiguousarray(self._vectors).ravel()
-            idx = unpack(flat, self._bits, n * self._dim).reshape(n, self._dim).astype(np.uint8)
-            comp = CompressedVectors(idx, np.ones(n, dtype=np.float32), self._dim, self._bits)
-            qz = Quantizer(d=self._dim, bits=self._bits, seed=self._seed)
-            self._remex_docmat = qz.decode(comp).astype(np.float32)
+            from ._remex import decode_rows
+            self._remex_docmat = decode_rows(
+                self._vectors, self._vectors.shape[0], self._dim, self._bits,
+                self._seed, self._remex_rotation,
+            )
         return self._remex_docmat
 
     def encode_query_code(self, vec: np.ndarray) -> np.ndarray:

@@ -186,12 +186,9 @@ def _remax_version() -> str:
 
 
 def _remex_version() -> str:
-    try:
-        import remex
+    from ._remex import version
 
-        return "remex-" + getattr(remex, "__version__", "0.0.0")
-    except ImportError:
-        return "remex-unknown"
+    return version()
 
 
 def pack(
@@ -308,11 +305,12 @@ def pack(
             raise ValueError("remex codec requires an L2-normalizing embedder")
         if not (1 <= bits <= 8):
             raise ValueError(f"remex bits must be in 1..8, got {bits}")
-        from remex import Quantizer, pack as remex_pack
+        from remex import pack as remex_pack
+        from ._remex import quantizer as remex_quantizer
 
         # remex does NOT center; truncate full-precision vectors directly.
         truncated = np.ascontiguousarray(vectors[:, :dim])
-        qz = Quantizer(d=dim, bits=bits, seed=seed)
+        qz = remex_quantizer(dim, bits, seed)  # remex's default rotation, recorded below
         comp = qz.encode(truncated)               # CompressedVectors (indices uint8)
         # Bit-pack indices to bits/coord. dim*bits is a multiple of 8, so the
         # global packing is exactly len(chunks)*bytes_per_row.
@@ -324,7 +322,7 @@ def pack(
             )
         binarizer = Binarizer.from_remex(
             remax_version=_remex_version(), dim=dim, bits=bits, seed=seed,
-            full_dim=full_dim,
+            full_dim=full_dim, rotation=qz.rotation,
         )
     chunks_jsonl = (
         "\n".join(

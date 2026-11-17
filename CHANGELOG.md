@@ -4,6 +4,40 @@
 
 Nothing yet.
 
+## v0.6.0 — 2026-11-17
+
+Runs on current remex. 0.5.0 pinned remex v0.6.0 because every remex read
+failed on remex ≥ 1.0 with `rotation mismatch: these codes were encoded with
+'haar' but this Quantizer uses 'rht'`: remex changed its default rotation, and
+remax_kb neither recorded the rotation nor passed it.
+
+### Changed
+
+- **Dependencies: `remex>=2.2.1,<3` from PyPI** (was a git pin to v0.6.0) and
+  `remax` v0.3.0 (was v0.2.0; its only library change is a bit-identical
+  speed-up of the single-query scan).
+- **New remex artifacts take remex's default rotation** — `"rht"` at even
+  `dim` — and record it as `binarizer.rotation` in both v1 (`.kb`) and v2
+  (`.kbi`) manifests. remax manifests are unchanged.
+- **remex decodes are renormalized** (remex ≥ 0.7 `renorm`), so `rows @ q` is
+  a cosine estimate; rankings move slightly versus remex 0.6.
+
+### Fixed
+
+- **Existing remex artifacts read on remex 2.x.** A remex binarizer without
+  `rotation` was written by remax_kb ≤ 0.5 on remex 0.6, which only built Haar
+  rotations, so readers and `KBWriter.open` treat a missing field as `"haar"`.
+  Re-committing such an index encodes new rows under Haar and writes the field.
+  `tests/fixtures/legacy_remex` holds a v1 and a v2 artifact built by 0.5.0 on
+  remex 0.6.0; the tests check the current reader decodes them to the same
+  directions remex 0.6.0 did.
+
+### Compatibility
+
+- remax_kb ≤ 0.5 cannot read a remex `.kb` written by 0.6.0: its v1
+  `Binarizer` refuses the new `rotation` key, and its remex 0.6 cannot build
+  `"rht"`. Upgrade readers first.
+
 ## v0.5.0 — 2026-08-04
 
 Cross-reader parity. The Python and JavaScript readers are now executed against

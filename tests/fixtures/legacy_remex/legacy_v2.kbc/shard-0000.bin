@@ -1,0 +1,7 @@
+{"sha256":"61cfccb529e11a7a446746658419182b572dc950ba3230f147966219673612d9","meta":{}}
+The raven flies at dawn and returns at dusk.{"sha256":"93901c256f35e0f541fa480cbf02d30f6bcaf9fa5d633263795ed72d0b6ce279","meta":{}}
+Hamming distance counts mismatched bits between two strings.{"sha256":"3ee1d615a043b2b3fcf30d477228d269dfd689edc34aa5165b07529822aa78ba","meta":{}}
+BM25 ranks documents by length-normalized term frequency.{"sha256":"844c10656d76b84b7fb91aab3729455ad3abd9cfad08e56440d6410a95dbe323","meta":{}}
+Centered SimHash projects vectors to bits while preserving cosine.{"sha256":"7127ba8c91af91d3e8df99f4498be2090dce0b22e987423ee599c240deda7d58","meta":{}}
+Federalist 10 argues that a large republic mitigates factions.{"sha256":"3c27b309838b78f1af2f26b690dbb36bc0b0b39636a7f2ed70c94a4f235a31a8","meta":{}}
+Range requests fetch byte slices over HTTP.

@@ -186,11 +186,15 @@ Differences from the remax codec, all reader-visible via the manifest:
   and the reader's subtract is a no-op. The query is truncated to `dim`
   directly, with no centering.
 - **`bits` carries the width** (`dim * bits` bits/chunk); `k = 1`.
+- **`rotation`** names the remex rotation the codes were encoded with
+  (`"rht"` for remex ≥ 1.0 at even `dim`, else `"haar"`). A remex manifest
+  without it was written by remax_kb ≤ 0.5 on remex 0.6 and is Haar; a reader
+  MUST NOT substitute the installed remex's default. Absent for remax.
 - **Scoring is inner-product**, not Hamming. `search()` returns an integer
   angular distance `round((1 - cosine) * 10000)` (≈0 for a near-identical
   match), ascending, so the result contract (best-first) matches the remax
   path.
-- **Determinism** is by `(dim, bits, seed)` — the Haar rotation and
+- **Determinism** is by `(dim, bits, seed, rotation)` — the rotation and
   Lloyd-Max boundaries are derived from these alone; nothing extra ships.
 - **Dependency:** the reader imports `remex` only for this kind (lazy), so
   remax-codec readers are unaffected.

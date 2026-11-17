@@ -150,6 +150,9 @@ class KBWriter:
         )
         self._quantizer_obj = None       # cached StackedSignBitQuantizer
         self._remex_q = None             # cached remex.Quantizer (codec == 'remex')
+        # remex rotation kind. None until the quantizer resolves remex's
+        # default for a new artifact; restored from the manifest on load.
+        self._remex_rotation = None
         self._rotations_i8 = None        # (codes_i8, scale_f32) when int8
         self._shard_max = shard_max_bytes
         self._bm25_k1 = bm25_k1
@@ -537,8 +540,9 @@ class KBWriter:
 
     def _remex_quantizer(self):
         if self._remex_q is None:
-            from remex import Quantizer
-            self._remex_q = Quantizer(d=self._dim, bits=self._bits, seed=self._seed)
+            from ._remex import quantizer
+            self._remex_q = quantizer(self._dim, self._bits, self._seed, self._remex_rotation)
+            self._remex_rotation = self._remex_q.rotation
         return self._remex_q
 
     def _encode_rows(self, embeddings: np.ndarray) -> np.ndarray:
@@ -694,6 +698,7 @@ class KBWriter:
                     "k": 1,
                     "bits": self._bits,
                     "seed": self._seed,
+                    "rotation": self._remex_quantizer().rotation,
                     "mean_vector_b64": _np_to_b64(self._mean_vector),
                 }
                 if self._codec == "remex"
@@ -757,6 +762,12 @@ class KBWriter:
         # Restore codec so mutation re-commits encode the same way.
         self._codec = "remex" if bq["kind"] == REMEX_KIND else "remax"
         self._bits = bq.get("bits", 1)
+        if self._codec == "remex":
+            # Re-commits must encode new rows under the rotation the existing
+            # rows were written with; a missing field means Haar (remax_kb._remex).
+            from ._remex import stored_rotation
+            self._remex_rotation = stored_rotation(bq)
+            self._remex_q = None
         row_bytes = self._row_bytes
         total = manifest["chunks"]["total_rows"]
         vectors = vectors.reshape(total, row_bytes)
@@ -887,8 +898,5 @@ def _remax_version() -> str:
 
 
 def _remex_version() -> str:
-    try:
-        import remex
-        return "remex-" + getattr(remex, "__version__", "0.0.0")
-    except Exception:
-        return "remex-unknown"
+    from ._remex import version
+    return version()

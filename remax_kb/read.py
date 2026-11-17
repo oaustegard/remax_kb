@@ -179,28 +179,18 @@ class KB:
     # ------------------------------------------------------------------ #
     # remex codec
     # ------------------------------------------------------------------ #
-    def _remex_quantizer(self):
-        from remex import Quantizer
-
-        b = self._m.binarizer
-        return Quantizer(d=b.dim, bits=b.bits, seed=b.seed)
-
     def _remex_doc_matrix(self) -> np.ndarray:
         """Decode the packed remex codes to approximate ``(N, dim)`` float
-        vectors once, then cache. remex vectors are unit-norm (the codec
-        requires an L2-normalizing embedder), so per-row norms are not stored
-        and are reconstructed as 1.0."""
+        vectors once, then cache. Rotation comes from the manifest; an
+        artifact that predates the field was encoded with Haar."""
         if self._remex_docmat is None:
-            from remex import unpack, CompressedVectors
+            from ._remex import LEGACY_ROTATION, decode_rows
 
             b = self._m.binarizer
-            n = len(self._chunks)
-            flat = np.ascontiguousarray(self._codes).ravel()
-            indices = unpack(flat, b.bits, n * b.dim).reshape(n, b.dim).astype(np.uint8)
-            comp = CompressedVectors(
-                indices, np.ones(n, dtype=np.float32), b.dim, b.bits
+            self._remex_docmat = decode_rows(
+                self._codes, len(self._chunks), b.dim, b.bits, b.seed,
+                b.rotation or LEGACY_ROTATION,
             )
-            self._remex_docmat = self._remex_quantizer().decode(comp).astype(np.float32)
         return self._remex_docmat
 
     def _search_remex(

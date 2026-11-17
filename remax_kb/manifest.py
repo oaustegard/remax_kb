@@ -55,6 +55,10 @@ class Binarizer:
     # bit); 1..8 for the remex Lloyd-Max codec. Defaults to 1 so manifests
     # written before this field deserialize unchanged.
     bits: int = 1
+    # remex codec only: the rotation the codes were encoded with ("haar",
+    # "rht", ...). Absent in remex artifacts written by remax_kb <= 0.5, which
+    # were all Haar (see remax_kb._remex.LEGACY_ROTATION). Never set for remax.
+    rotation: str | None = None
 
     @property
     def mean_vector(self) -> np.ndarray:
@@ -90,11 +94,13 @@ class Binarizer:
         bits: int,
         seed: int,
         full_dim: int,
+        rotation: str,
     ) -> "Binarizer":
         """remex codec descriptor. remex does NOT center (it normalizes +
         rotates per-vector; centering measurably hurts it), so the stored
         mean is zeros and the reader's subtract is a no-op. k is fixed to 1
-        and unused. The rotation is seed-derived, so nothing extra ships."""
+        and unused. The rotation matrix is seed-derived, so nothing extra
+        ships, but its kind is recorded: remex changed its default."""
         zeros = np.zeros(int(full_dim), dtype="<f4")
         return cls(
             kind=REMEX_KIND,
@@ -104,6 +110,7 @@ class Binarizer:
             seed=int(seed),
             mean_vector_b64=base64.b64encode(zeros.tobytes()).decode("ascii"),
             bits=int(bits),
+            rotation=str(rotation),
         )
 
 
@@ -144,7 +151,11 @@ class Manifest:
         return cls.from_dict(json.loads(text))
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if d["binarizer"].get("rotation") is None:
+            # remax manifests carry no rotation; keep them byte-identical.
+            d["binarizer"].pop("rotation", None)
+        return d
 
     def to_json(self, *, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
@@ -176,6 +187,8 @@ class Manifest:
             raise ValueError(
                 f"binarizer.k must be positive, got {self.binarizer.k}"
             )
+        if self.binarizer.rotation is not None and self.binarizer.kind != REMEX_KIND:
+            raise ValueError("binarizer.rotation is only valid for the remex codec")
         if self.binarizer.kind == REMEX_KIND:
             if not (1 <= self.binarizer.bits <= 8):
                 raise ValueError(

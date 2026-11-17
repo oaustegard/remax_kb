@@ -284,7 +284,7 @@ quantization (rotation + per-coordinate quantization) instead of 1-bit
 SimHash — higher fidelity to the float ranking on general (isotropic)
 embedders such as Jina; on specialized, tightly-clustered embedders (e.g.
 SPECTER2) 1-bit can win, so it is a per-embedder choice. The binarizer block
-carries `"bits"` (1–8) and `"k": 1`, and omits `projection` /
+carries `"bits"` (1–8), `"k": 1` and `"rotation"`, and omits `projection` /
 `rotations_quant`. Differences from the remax codec, all manifest-visible:
 
 - **No centering.** `mean_vector_b64` is all zeros; the reader truncates the
@@ -296,8 +296,15 @@ carries `"bits"` (1–8) and `"k": 1`, and omits `projection` /
   (norms reconstructed as `1.0` — the codec requires an L2-normalizing
   embedder, so per-row norms are not stored), decodes, and ranks by inner
   product against the query.
-- **No rotation sidecar** — the Haar rotation and Lloyd-Max boundaries are
-  derived from `(dim, bits, seed)` alone.
+- **`rotation`** names the remex rotation the codes were encoded with
+  (`"rht"` for writers on remex ≥ 1.0 at even `dim`, `"haar"` otherwise). It
+  is part of the encoding: decoding under another rotation returns noise, and
+  remex refuses it. A remex binarizer block **without** the field was written
+  by remax_kb ≤ 0.5 on remex 0.6, whose only rotation was Haar, so readers and
+  re-committing writers MUST treat a missing `rotation` as `"haar"`, never as
+  the installed remex's default.
+- **No rotation sidecar** — the rotation and Lloyd-Max boundaries are
+  derived from `(dim, bits, seed, rotation)` alone.
 - **Dense distance** reported by the reader is an integer angular distance
   `round((1 − cosine) · 10000)` (ascending, ≈0 for a near-identical match),
   so RRF / hybrid fusion is unchanged.
