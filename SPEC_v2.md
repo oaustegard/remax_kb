@@ -284,8 +284,8 @@ quantization (rotation + per-coordinate quantization) instead of 1-bit
 SimHash — higher fidelity to the float ranking on general (isotropic)
 embedders such as Jina; on specialized, tightly-clustered embedders (e.g.
 SPECTER2) 1-bit can win, so it is a per-embedder choice. The binarizer block
-carries `"bits"` (1–8), `"k": 1` and `"rotation"`, and omits `projection` /
-`rotations_quant`. Differences from the remax codec, all manifest-visible:
+carries `"bits"` (1–8), `"k": 1` and `"rotation"` (see below; missing in
+older files), and omits `projection` / `rotations_quant`. Differences from the remax codec, all manifest-visible:
 
 - **No centering.** `mean_vector_b64` is all zeros; the reader truncates the
   query to `dim` and scores by inner product (centering measurably hurts
@@ -294,27 +294,36 @@ carries `"bits"` (1–8), `"k": 1` and `"rotation"`, and omits `projection` /
   (`remex.pack`), `dim * bits` bits/row, byte-aligned. The reader recovers
   indices with `remex.unpack`, wraps them in a `remex.CompressedVectors`
   (norms reconstructed as `1.0` — the codec requires an L2-normalizing
-  embedder, so per-row norms are not stored), decodes, and ranks by inner
-  product against the query.
-- **`rotation`** names the remex rotation the codes were encoded with
-  (`"rht"` for writers on remex ≥ 1.0 at even `dim`, `"haar"` otherwise). It
-  is part of the encoding: decoding under another rotation returns noise, and
-  remex refuses it. A remex binarizer block **without** the field was written
-  by remax_kb ≤ 0.5 on remex 0.6, whose only rotation was Haar, so readers and
-  re-committing writers MUST treat a missing `rotation` as `"haar"`, never as
-  the installed remex's default.
-- **No rotation sidecar** — the rotation and Lloyd-Max boundaries are
-  derived from `(dim, bits, seed, rotation)` alone.
+  embedder, so per-row norms are not stored), decodes, rescales each decoded
+  row to unit length (remex's `renorm`, on by default), and ranks by inner
+  product against the query, which for unit rows is the cosine.
+- **`rotation`** names which seeded random rotation remex applied before
+  quantizing: `"haar"` (a dense Haar-random orthogonal matrix) or `"rht"` (a
+  randomized Hadamard transform: seeded sign flips and permutations mixed by
+  Hadamard blocks, applied without building the matrix). A reader MUST decode
+  with the rotation named here; codes decoded under the other rotation are
+  noise, and remex raises `rotation mismatch` rather than return them.
+  A writer records the rotation it actually used; remax_kb writers take
+  remex's default, which is `"rht"` at even `dim`. **A missing `rotation`
+  means `"haar"`**: files without the field predate it, and the remex
+  versions that wrote them had only Haar. Readers MUST NOT fill a missing
+  field from the installed remex's default. A writer re-committing such an
+  index encodes new rows under `"haar"` and writes the field; the rotation
+  holds across `sync`/`compact` re-encodes, like the zero mean.
+- **No rotation sidecar** — the rotation matrix and Lloyd-Max boundaries are
+  derived from `dim`, `bits`, `seed` and the `rotation` kind alone.
 - **Dense distance** reported by the reader is an integer angular distance
   `round((1 − cosine) · 10000)` (ascending, ≈0 for a near-identical match),
-  so RRF / hybrid fusion is unchanged.
-- **Dependency:** the reader imports `remex` only for this kind.
+  so RRF / hybrid fusion works on the same best-first contract as the remax
+  codec.
+- **Dependency:** the reader imports `remex` only for this kind, and needs
+  remex ≥ 1.0 to build `"rht"` (remax_kb pins `remex>=2.2.1,<3`).
 - **Reader support is asymmetric, and deliberately so.** Decoding a remex row
-  needs both the Lloyd-Max centroid table and the Haar rotation, and the
-  artifact ships neither: they come out of numpy/scipy from `(dim, bits,
-  seed)` — PCG64 + Ziggurat + an explicit Householder QR, plus a
+  needs both the Lloyd-Max centroid table and the rotation, and the artifact
+  ships neither: they come out of numpy/scipy from the seed — PCG64 draws
+  (with Ziggurat and an explicit Householder QR for Haar), plus a
   300-iteration Lloyd loop over the Gaussian CDF. A JavaScript reader cannot
-  reproduce either bit-for-bit, and a rotation that is merely *close* is not
+  reproduce these bit-for-bit, and a rotation that is merely *close* is not
   an approximation of the right one (see §projection: mixing projections
   "flips ~50% of code bits and collapses recall to chance"). A reader that
   cannot decode this kind MUST refuse it **by name at open** — naming the

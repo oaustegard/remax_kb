@@ -186,18 +186,26 @@ Differences from the remax codec, all reader-visible via the manifest:
   and the reader's subtract is a no-op. The query is truncated to `dim`
   directly, with no centering.
 - **`bits` carries the width** (`dim * bits` bits/chunk); `k = 1`.
-- **`rotation`** names the remex rotation the codes were encoded with
-  (`"rht"` for remex ≥ 1.0 at even `dim`, else `"haar"`). A remex manifest
-  without it was written by remax_kb ≤ 0.5 on remex 0.6 and is Haar; a reader
-  MUST NOT substitute the installed remex's default. Absent for remax.
+- **`binarizer.rotation`** names which seeded random rotation remex applied
+  before quantizing: `"haar"` (a dense Haar-random orthogonal matrix) or
+  `"rht"` (a randomized Hadamard transform). A reader MUST decode with the
+  rotation named here; codes decoded under the other one are noise. A writer
+  records the rotation it actually used (remax_kb takes remex's default,
+  `"rht"` at even `dim`). **A missing `rotation` means `"haar"`**: files
+  without the field predate it, and the remex versions that wrote them had
+  only Haar, so a reader MUST NOT fill it from the installed remex's default.
+  The field is absent for the remax codec.
 - **Scoring is inner-product**, not Hamming. `search()` returns an integer
   angular distance `round((1 - cosine) * 10000)` (≈0 for a near-identical
   match), ascending, so the result contract (best-first) matches the remax
-  path.
-- **Determinism** is by `(dim, bits, seed, rotation)` — the rotation and
-  Lloyd-Max boundaries are derived from these alone; nothing extra ships.
+  path. Decoded rows are rescaled to unit length (remex's `renorm`) before
+  the inner product, so the score is a cosine.
+- **Determinism** — the rotation matrix and Lloyd-Max boundaries are derived
+  from `dim`, `bits`, `seed` and the `rotation` kind alone; nothing extra
+  ships.
 - **Dependency:** the reader imports `remex` only for this kind (lazy), so
-  remax-codec readers are unaffected.
+  remax-codec readers are unaffected. Decoding `"rht"` needs remex ≥ 1.0
+  (remax_kb pins `remex>=2.2.1,<3`).
 
 ## `chunks.jsonl`
 
